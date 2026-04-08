@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 
 
 APP_NAME = "AutoCPV"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 DEFAULT_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSe4bZ7PPgQK66LOBgXMc5gCG11p02ueQXB9glD2i4mvivJtXQ/viewform"
 SESSION_FILETYPES = [("AutoCPV Session", "*.autocpv.json"), ("JSON", "*.json")]
 DEFAULT_FACEBOOK_SEARCH = "https://www.facebook.com/search/top?q="
@@ -351,6 +351,7 @@ class FormFillerApp:
         self.last_deleted = None
         self.history_entries = []
         self.editor_widgets = {}
+        self.help_popup = None
 
         self.excel_path_var = tk.StringVar()
         self.form_url_var = tk.StringVar(value=DEFAULT_FORM_URL)
@@ -398,10 +399,9 @@ class FormFillerApp:
         header_left.pack(side="left", fill="x", expand=True)
         header_button_row = ttk.Frame(header_left, style="Header.TFrame")
         header_button_row.pack(anchor="w", pady=(0, 10))
-        ttk.Button(header_button_row, text="Tecles ràpides", command=self.show_shortcuts_help, style="Neutral.TButton").pack(side="left")
-        ttk.Button(header_button_row, text="Dividir PDF OCR", command=self.open_splitter_tab, style="Neutral.TButton").pack(side="left", padx=(8, 0))
+        self.make_help_button(header_button_row, "Tecles ràpides", self.show_shortcuts_help, "Mostra la llista d'accessos ràpids.").pack(side="left")
         ttk.Label(header_left, text=APP_NAME, style="HeaderTitle.TLabel").pack(anchor="w")
-        ttk.Label(header_left, text=f"Versió {APP_VERSION} amb revisió, validació i sessió de treball.", style="HeaderSub.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Label(header_left, text=f"Versió {APP_VERSION}", style="HeaderSub.TLabel").pack(anchor="w", pady=(2, 0))
 
         notebook_wrap = ttk.Frame(self.root, style="Root.TFrame", padding=(16, 14, 16, 8))
         notebook_wrap.pack(fill="both", expand=True)
@@ -419,37 +419,37 @@ class FormFillerApp:
 
         ttk.Label(top_card, text="Excel", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(top_card, textvariable=self.excel_path_var, width=92).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(top_card, text="Buscar", command=self.pick_excel, style="Neutral.TButton").grid(row=0, column=2, padx=4)
-        ttk.Button(top_card, text="Carregar Excel", command=self.load_excel, style="Neutral.TButton").grid(row=0, column=3, padx=4)
-        ttk.Button(top_card, text="Guardar sessió", command=self.save_session, style="Neutral.TButton").grid(row=0, column=4, padx=4)
-        ttk.Button(top_card, text="Obrir sessió", command=self.load_session, style="Neutral.TButton").grid(row=0, column=5, padx=4)
+        self.make_help_button(top_card, "Buscar", self.pick_excel, "Selecciona un fitxer Excel del teu ordinador.").grid(row=0, column=2, padx=4)
+        self.make_help_button(top_card, "Carregar Excel", self.load_excel, "Llig l'Excel i carrega les files a la taula.").grid(row=0, column=3, padx=4)
+        self.make_help_button(top_card, "Guardar sessió", self.save_session, "Guarda l'estat actual per continuar després.").grid(row=0, column=4, padx=4)
+        self.make_help_button(top_card, "Obrir sessió", self.load_session, "Recupera una sessió guardada anteriorment.").grid(row=0, column=5, padx=4)
 
         ttk.Label(top_card, text="Formulari", style="Section.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Entry(top_card, textvariable=self.form_url_var, width=92).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(top_card, text="Llegir formulari", command=self.load_form, style="Neutral.TButton").grid(row=1, column=2, padx=4)
-        ttk.Button(top_card, text="Previsualitzar enviament", command=self.preview_current_payload, style="Neutral.TButton").grid(row=1, column=3, padx=4)
-        ttk.Button(top_card, text="Revisió ampla", command=self.open_review_mode, style="Neutral.TButton").grid(row=1, column=4, padx=4)
+        self.make_help_button(top_card, "Llegir formulari", self.load_form, "Detecta els camps del Google Form automàticament.").grid(row=1, column=2, padx=4)
+        self.make_help_button(top_card, "Previsualitzar enviament", self.preview_current_payload, "Mostra exactament què s'enviarà al formulari.").grid(row=1, column=3, padx=4)
+        self.make_help_button(top_card, "Revisió ampla", self.open_review_mode, "Obri un editor més gran per revisar la fila.").grid(row=1, column=4, padx=4)
 
         ttk.Label(top_card, text="Persona", style="Section.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Combobox(top_card, textvariable=self.person_var, values=PERSON_OPTIONS, width=16, state="readonly").grid(row=2, column=1, sticky="w", padx=8, pady=4)
         ttk.Label(top_card, text="Font per defecte", style="Section.TLabel").grid(row=2, column=1, sticky="e")
         ttk.Entry(top_card, textvariable=self.fallback_font_var, width=44).grid(row=2, column=2, sticky="ew", padx=8, pady=4)
-        ttk.Button(top_card, text="Aplicar a totes", command=self.apply_fallback_font_to_all, style="Neutral.TButton").grid(row=2, column=3, padx=4)
-        ttk.Button(top_card, text="Aplicar només a buides", command=self.apply_fallback_font_to_empty, style="Neutral.TButton").grid(row=2, column=4, padx=4)
+        self.make_help_button(top_card, "Aplicar a totes", self.apply_fallback_font_to_all, "Copia la font per defecte a totes les files.").grid(row=2, column=3, padx=4)
+        self.make_help_button(top_card, "Aplicar només a buides", self.apply_fallback_font_to_empty, "Ompli només les files que no tenen font.").grid(row=2, column=4, padx=4)
         top_card.columnconfigure(1, weight=1)
 
         controls = ttk.Frame(self.main_tab, style="Root.TFrame", padding=(0, 0, 0, 10))
         controls.pack(fill="x")
         controls_card = ttk.Frame(controls, style="Card.TFrame", padding=10)
         controls_card.pack(fill="x")
-        ttk.Button(controls_card, text="Aplicar canvis", command=self.apply_current_record, style="Neutral.TButton").pack(side="left", padx=4)
-        ttk.Button(controls_card, text="Eliminar fila", command=self.delete_current_record, style="Neutral.TButton").pack(side="left", padx=4)
-        ttk.Button(controls_card, text="Desfer eliminació", command=self.undo_delete_record, style="Neutral.TButton").pack(side="left", padx=4)
-        ttk.Button(controls_card, text="Buscar a Google", command=self.open_google_search, style="Neutral.TButton").pack(side="left", padx=4)
-        ttk.Button(controls_card, text="Buscar font", command=self.open_source_helper, style="Neutral.TButton").pack(side="left", padx=4)
-        ttk.Button(controls_card, text="Obrir font", command=self.open_source, style="Neutral.TButton").pack(side="left", padx=4)
-        ttk.Button(controls_card, text="Enviar fila seleccionada", command=self.submit_selected, style="Neutral.TButton").pack(side="right", padx=4)
-        ttk.Button(controls_card, text="Enviar-les totes", command=self.submit_all, style="Neutral.TButton").pack(side="right", padx=4)
+        self.make_help_button(controls_card, "Aplicar canvis", self.apply_current_record, "Guarda manualment els canvis de la fila actual.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Eliminar fila", self.delete_current_record, "Esborra completament la fila seleccionada.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Desfer eliminació", self.undo_delete_record, "Recupera l'última fila eliminada.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Buscar a Google", self.open_google_search, "Busca l'activitat actual a Google.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Buscar font", self.open_source_helper, "Ajuda a trobar una font si encara no en tens.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Obrir font", self.open_source, "Obri l'enllaç de la font guardada.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Enviar fila seleccionada", self.submit_selected, "Envia només la fila actual al formulari.").pack(side="right", padx=4)
+        self.make_help_button(controls_card, "Enviar-les totes", self.submit_all, "Envia totes les files preparades al formulari.").pack(side="right", padx=4)
 
         body = ttk.PanedWindow(self.main_tab, orient="horizontal")
         body.pack(fill="both", expand=True, pady=(0, 10))
@@ -551,6 +551,11 @@ class FormFillerApp:
             return ttk.Combobox(parent, textvariable=self.editor_vars[key], values=FIELD_OPTIONS[key], state="readonly", width=48)
         width = 60 if key in {"nom", "companyia", "lloc", "font"} else 50
         return ttk.Entry(parent, textvariable=self.editor_vars[key], width=width)
+
+    def make_help_button(self, parent, text, command, help_text):
+        button = ttk.Button(parent, text=text, command=command, style="Neutral.TButton")
+        button.bind("<Button-3>", lambda event, msg=help_text: self.show_button_help(event, msg))
+        return button
 
     def build_splitter_tab(self):
         outer = ttk.Frame(self.splitter_tab, style="Root.TFrame", padding=(0, 0, 0, 10))
@@ -717,6 +722,35 @@ class FormFillerApp:
 
     def set_status(self, text):
         self.status_var.set(text)
+
+    def show_button_help(self, event, text):
+        self.hide_button_help()
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(bg=COLORS["charcoal"])
+        label = tk.Label(
+            popup,
+            text=text,
+            bg=COLORS["charcoal"],
+            fg="white",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=6,
+        )
+        label.pack()
+        popup.geometry(f"+{event.x_root + 8}+{event.y_root + 8}")
+        self.help_popup = popup
+        self.root.after(2200, self.hide_button_help)
+        return "break"
+
+    def hide_button_help(self):
+        if self.help_popup is not None:
+            try:
+                self.help_popup.destroy()
+            except tk.TclError:
+                pass
+            self.help_popup = None
 
     def set_split_status(self, text):
         self.split_status_var.set(text)
