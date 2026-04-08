@@ -1,5 +1,5 @@
 #define MyAppName "AutoCPV"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1"
 #define MyAppPublisher "Pol Solsona Franch"
 #define MyAppExeName "AutoCPV.exe"
 #define MyAppAssocName "AutoCPV"

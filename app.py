@@ -1,22 +1,25 @@
 import datetime as dt
 import html
 import json
+import os
 import re
 import threading
 import tkinter as tk
 import urllib.parse
 import urllib.request
 import webbrowser
+from io import BytesIO
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import openpyxl
 from PIL import Image, ImageTk
+from pypdf import PdfReader, PdfWriter
 
 
 APP_NAME = "AutoCPV"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 DEFAULT_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSe4bZ7PPgQK66LOBgXMc5gCG11p02ueQXB9glD2i4mvivJtXQ/viewform"
 SESSION_FILETYPES = [("AutoCPV Session", "*.autocpv.json"), ("JSON", "*.json")]
 DEFAULT_FACEBOOK_SEARCH = "https://www.facebook.com/search/top?q="
@@ -357,6 +360,12 @@ class FormFillerApp:
         self.status_var = tk.StringVar(value="A punt.")
         self.validation_var = tk.StringVar(value="Sense validacions pendents.")
         self.editor_vars = {key: tk.StringVar() for key in FIELD_LABELS}
+        self.split_pdf_path_var = tk.StringVar()
+        self.split_output_dir_var = tk.StringVar()
+        self.split_status_var = tk.StringVar(value="A punt per a dividir PDFs OCR.")
+        self.split_summary_var = tk.StringVar(value="Encara no hi ha cap PDF carregat.")
+        self.split_progress_var = tk.DoubleVar(value=0.0)
+        self.split_result_cards = []
 
         self.configure_styles()
         self.build_ui()
@@ -389,11 +398,21 @@ class FormFillerApp:
         header_left.pack(side="left", fill="x", expand=True)
         header_button_row = ttk.Frame(header_left, style="Header.TFrame")
         header_button_row.pack(anchor="w", pady=(0, 10))
-        ttk.Button(header_button_row, text="Tecles ràpides", command=self.show_shortcuts_help, style="Neutral.TButton").pack(anchor="w")
+        ttk.Button(header_button_row, text="Tecles ràpides", command=self.show_shortcuts_help, style="Neutral.TButton").pack(side="left")
+        ttk.Button(header_button_row, text="Dividir PDF OCR", command=self.open_splitter_tab, style="Neutral.TButton").pack(side="left", padx=(8, 0))
         ttk.Label(header_left, text=APP_NAME, style="HeaderTitle.TLabel").pack(anchor="w")
         ttk.Label(header_left, text=f"Versió {APP_VERSION} amb revisió, validació i sessió de treball.", style="HeaderSub.TLabel").pack(anchor="w", pady=(2, 0))
 
-        top = ttk.Frame(self.root, style="Root.TFrame", padding=(16, 14, 16, 8))
+        notebook_wrap = ttk.Frame(self.root, style="Root.TFrame", padding=(16, 14, 16, 8))
+        notebook_wrap.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(notebook_wrap)
+        self.notebook.pack(fill="both", expand=True)
+        self.main_tab = ttk.Frame(self.notebook, style="Root.TFrame")
+        self.splitter_tab = ttk.Frame(self.notebook, style="Root.TFrame")
+        self.notebook.add(self.main_tab, text="Formularis")
+        self.notebook.add(self.splitter_tab, text="Divisor PDF OCR")
+
+        top = ttk.Frame(self.main_tab, style="Root.TFrame", padding=(0, 0, 0, 8))
         top.pack(fill="x")
         top_card = ttk.Frame(top, style="Card.TFrame", padding=14)
         top_card.pack(fill="x")
@@ -419,7 +438,7 @@ class FormFillerApp:
         ttk.Button(top_card, text="Aplicar només a buides", command=self.apply_fallback_font_to_empty, style="Neutral.TButton").grid(row=2, column=4, padx=4)
         top_card.columnconfigure(1, weight=1)
 
-        controls = ttk.Frame(self.root, style="Root.TFrame", padding=(16, 0, 16, 10))
+        controls = ttk.Frame(self.main_tab, style="Root.TFrame", padding=(0, 0, 0, 10))
         controls.pack(fill="x")
         controls_card = ttk.Frame(controls, style="Card.TFrame", padding=10)
         controls_card.pack(fill="x")
@@ -432,8 +451,8 @@ class FormFillerApp:
         ttk.Button(controls_card, text="Enviar fila seleccionada", command=self.submit_selected, style="Neutral.TButton").pack(side="right", padx=4)
         ttk.Button(controls_card, text="Enviar-les totes", command=self.submit_all, style="Neutral.TButton").pack(side="right", padx=4)
 
-        body = ttk.PanedWindow(self.root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        body = ttk.PanedWindow(self.main_tab, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=(0, 10))
 
         left = ttk.Frame(body, style="Card.TFrame", padding=10)
         right = ttk.Frame(body, style="Card.TFrame", padding=16)
@@ -522,6 +541,8 @@ class FormFillerApp:
         right.columnconfigure(1, weight=1)
         right.rowconfigure(row_index, weight=1)
 
+        self.build_splitter_tab()
+
         status = ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", padding=(16, 0, 16, 12))
         status.pack(fill="x")
 
@@ -530,6 +551,89 @@ class FormFillerApp:
             return ttk.Combobox(parent, textvariable=self.editor_vars[key], values=FIELD_OPTIONS[key], state="readonly", width=48)
         width = 60 if key in {"nom", "companyia", "lloc", "font"} else 50
         return ttk.Entry(parent, textvariable=self.editor_vars[key], width=width)
+
+    def build_splitter_tab(self):
+        outer = ttk.Frame(self.splitter_tab, style="Root.TFrame", padding=(0, 0, 0, 10))
+        outer.pack(fill="both", expand=True)
+
+        hero_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        hero_card.pack(fill="x", pady=(0, 10))
+        ttk.Label(hero_card, text="Divisor PDF OCR", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            hero_card,
+            text="Divideix PDFs grans en parts de fins a 24 MB per poder-los compartir o pujar més fàcilment.",
+            style="Body.TLabel",
+            wraplength=1100,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        top_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        top_card.pack(fill="x")
+
+        ttk.Label(top_card, text="PDF OCR", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top_card, textvariable=self.split_pdf_path_var, width=92).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(top_card, text="Buscar PDF", command=self.pick_split_pdf, style="Neutral.TButton").grid(row=0, column=2, padx=4)
+
+        ttk.Label(top_card, text="Carpeta d'eixida", style="Section.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Entry(top_card, textvariable=self.split_output_dir_var, width=92).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(top_card, text="Buscar carpeta", command=self.pick_split_output_dir, style="Neutral.TButton").grid(row=1, column=2, padx=4)
+        ttk.Button(top_card, text="Dividir a 24 MB", command=self.run_split_pdf, style="Neutral.TButton").grid(row=1, column=3, padx=4)
+        top_card.columnconfigure(1, weight=1)
+
+        drop_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        drop_card.pack(fill="x", pady=(10, 0))
+        self.drop_zone = tk.Label(
+            drop_card,
+            text="Arrossega ací un PDF OCR o fes clic per a seleccionar-lo",
+            bg=COLORS["rose"],
+            fg=COLORS["charcoal"],
+            font=("Segoe UI Semibold", 11),
+            padx=20,
+            pady=20,
+            relief="flat",
+            cursor="hand2",
+        )
+        self.drop_zone.pack(fill="x")
+        self.drop_zone.bind("<Button-1>", lambda _event: self.pick_split_pdf())
+        self.enable_drop_support()
+
+        summary_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        summary_card.pack(fill="x", pady=(10, 0))
+        ttk.Label(summary_card, text="Resum", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(summary_card, textvariable=self.split_summary_var, style="Body.TLabel", wraplength=1100, justify="left").pack(anchor="w", pady=(6, 10))
+        self.split_progress = ttk.Progressbar(summary_card, maximum=100, variable=self.split_progress_var)
+        self.split_progress.pack(fill="x")
+        self.open_output_button = ttk.Button(summary_card, text="Obrir carpeta d'eixida", command=self.open_split_output_dir, style="Neutral.TButton")
+        self.open_output_button.pack(anchor="e", pady=(10, 0))
+
+        info_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        info_card.pack(fill="both", expand=True, pady=(10, 0))
+        ttk.Label(info_card, text="Resultat del divisor", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            info_card,
+            text="La ferramenta divideix el PDF només per pes aproximat, sense interpretar el contingut. Si una pàgina sola supera el límit, es guardarà igual en una part pròpia.",
+            style="Body.TLabel",
+            wraplength=1100,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 12))
+
+        self.results_cards_frame = ttk.Frame(info_card, style="Card.TFrame")
+        self.results_cards_frame.pack(fill="x", pady=(0, 12))
+
+        self.split_log_box = tk.Text(
+            info_card,
+            wrap="word",
+            font=("Consolas", 10),
+            bg="white",
+            fg=COLORS["charcoal"],
+            relief="flat",
+            padx=12,
+            pady=12,
+        )
+        self.split_log_box.pack(fill="both", expand=True)
+        self.split_log_box.configure(state="disabled")
+
+        ttk.Label(outer, textvariable=self.split_status_var, style="Status.TLabel", padding=(0, 8, 0, 0)).pack(fill="x")
 
     def bind_editor_events(self):
         for variable in self.editor_vars.values():
@@ -613,6 +717,155 @@ class FormFillerApp:
 
     def set_status(self, text):
         self.status_var.set(text)
+
+    def set_split_status(self, text):
+        self.split_status_var.set(text)
+
+    def append_split_log(self, text):
+        self.split_log_box.configure(state="normal")
+        self.split_log_box.insert("end", text + "\n")
+        self.split_log_box.see("end")
+        self.split_log_box.configure(state="disabled")
+
+    def set_split_progress(self, current, total):
+        percent = 0 if total <= 0 else (current / total) * 100
+        self.split_progress_var.set(percent)
+
+    def clear_split_results(self):
+        for widget in self.results_cards_frame.winfo_children():
+            widget.destroy()
+
+    def add_split_result_card(self, file_path: Path, pages_text: str):
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        card = tk.Frame(self.results_cards_frame, bg="white", highlightbackground=COLORS["line"], highlightthickness=1)
+        card.pack(fill="x", pady=5)
+        tk.Label(card, text=file_path.name, bg="white", fg=COLORS["red"], font=("Segoe UI Semibold", 11), anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(card, text=f"{pages_text}  |  {size_mb:.2f} MB", bg="white", fg=COLORS["charcoal"], font=("Segoe UI", 10), anchor="w").pack(fill="x", padx=12, pady=(0, 10))
+
+    def open_split_output_dir(self):
+        path = self.split_output_dir_var.get().strip()
+        if path and Path(path).exists():
+            os.startfile(path)  # type: ignore[attr-defined]
+
+    def enable_drop_support(self):
+        try:
+            self.root.tk.call("package", "require", "tkdnd")
+            self.drop_zone.drop_target_register("DND_Files")
+            self.drop_zone.dnd_bind("<<Drop>>", self.on_drop_pdf)
+            self.drop_zone.configure(text="Arrossega ací un PDF OCR o fes clic per a seleccionar-lo")
+        except Exception:
+            self.drop_zone.configure(text="Fes clic ací per a seleccionar un PDF OCR")
+
+    def on_drop_pdf(self, event):
+        raw = event.data.strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            raw = raw[1:-1]
+        path = Path(raw)
+        if path.exists():
+            self.split_pdf_path_var.set(str(path))
+            default_output = path.with_name(f"{path.stem}_parts")
+            self.split_output_dir_var.set(str(default_output))
+            self.split_summary_var.set(f"PDF carregat: {path.name} | {path.stat().st_size / (1024 * 1024):.2f} MB")
+            self.set_split_status("PDF preparat per a dividir.")
+
+    def open_splitter_tab(self):
+        self.notebook.select(self.splitter_tab)
+
+    def pick_split_pdf(self):
+        path = filedialog.askopenfilename(title="Selecciona un PDF OCR", filetypes=[("PDF", "*.pdf"), ("Tots", "*.*")])
+        if path:
+            self.split_pdf_path_var.set(path)
+            source = Path(path)
+            default_output = source.with_name(f"{source.stem}_parts")
+            self.split_output_dir_var.set(str(default_output))
+            self.split_summary_var.set(f"PDF carregat: {source.name} | {source.stat().st_size / (1024 * 1024):.2f} MB")
+            self.split_progress_var.set(0)
+            self.set_split_status("PDF preparat per a dividir.")
+
+    def pick_split_output_dir(self):
+        path = filedialog.askdirectory(title="Selecciona carpeta d'eixida")
+        if path:
+            self.split_output_dir_var.set(path)
+
+    def run_split_pdf(self):
+        source_path = Path(self.split_pdf_path_var.get().strip())
+        output_dir = Path(self.split_output_dir_var.get().strip()) if self.split_output_dir_var.get().strip() else None
+        if not source_path.exists():
+            messagebox.showwarning("Falta el PDF", "Selecciona un PDF OCR vàlid.")
+            return
+        if output_dir is None:
+            output_dir = source_path.with_name(f"{source_path.stem}_parts")
+            self.split_output_dir_var.set(str(output_dir))
+
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.clear_split_results()
+            self.split_progress_var.set(0)
+            created = self.split_pdf_by_size(source_path, output_dir, max_size_mb=24)
+        except Exception as exc:
+            messagebox.showerror("Error dividint el PDF", str(exc))
+            self.set_split_status("No s'ha pogut dividir el PDF.")
+            return
+
+        self.split_log_box.configure(state="normal")
+        self.split_log_box.delete("1.0", "end")
+        self.split_log_box.configure(state="disabled")
+        self.append_split_log(f"PDF original: {source_path}")
+        self.append_split_log(f"Carpeta d'eixida: {output_dir}")
+        for item, page_indexes in created:
+            size_mb = item.stat().st_size / (1024 * 1024)
+            self.append_split_log(f"- {item.name}: {size_mb:.2f} MB")
+            pages_text = f"Pàgines {page_indexes[0] + 1}-{page_indexes[-1] + 1}" if len(page_indexes) > 1 else f"Pàgina {page_indexes[0] + 1}"
+            self.add_split_result_card(item, pages_text)
+        original_mb = source_path.stat().st_size / (1024 * 1024)
+        self.split_summary_var.set(
+            f"PDF original: {source_path.name} ({original_mb:.2f} MB) | Parts creades: {len(created)} | Límit per part: 24 MB"
+        )
+        self.split_progress_var.set(100)
+        self.set_split_status(f"PDF dividit en {len(created)} parts.")
+        self.notebook.select(self.splitter_tab)
+        self.open_split_output_dir()
+
+    def split_pdf_by_size(self, source_path: Path, output_dir: Path, max_size_mb=24):
+        max_bytes = int(max_size_mb * 1024 * 1024)
+        reader = PdfReader(str(source_path))
+        created_files = []
+        chunk_page_indexes = []
+        part_number = 1
+
+        def writer_size(page_indexes):
+            writer = PdfWriter()
+            for page_index in page_indexes:
+                writer.add_page(reader.pages[page_index])
+            buffer = BytesIO()
+            writer.write(buffer)
+            return buffer.getbuffer().nbytes
+
+        total_pages = len(reader.pages)
+        for page_index in range(total_pages):
+            proposed = chunk_page_indexes + [page_index]
+            proposed_size = writer_size(proposed)
+            if chunk_page_indexes and proposed_size > max_bytes:
+                created_files.append((self.save_pdf_chunk(reader, chunk_page_indexes, output_dir, source_path.stem, part_number), list(chunk_page_indexes)))
+                part_number += 1
+                chunk_page_indexes = [page_index]
+            else:
+                chunk_page_indexes = proposed
+            self.set_split_progress(page_index + 1, total_pages)
+
+        if chunk_page_indexes:
+            created_files.append((self.save_pdf_chunk(reader, chunk_page_indexes, output_dir, source_path.stem, part_number), list(chunk_page_indexes)))
+
+        return created_files
+
+    def save_pdf_chunk(self, reader, page_indexes, output_dir: Path, stem: str, part_number: int):
+        writer = PdfWriter()
+        for page_index in page_indexes:
+            writer.add_page(reader.pages[page_index])
+        output_path = output_dir / f"{stem}_part_{part_number:02d}.pdf"
+        with output_path.open("wb") as handle:
+            writer.write(handle)
+        return output_path
 
     def show_shortcuts_help(self):
         window = tk.Toplevel(self.root)
