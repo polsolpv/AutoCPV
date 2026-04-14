@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 
 
 APP_NAME = "AutoCPV"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 DEFAULT_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSe4bZ7PPgQK66LOBgXMc5gCG11p02ueQXB9glD2i4mvivJtXQ/viewform"
 SESSION_FILETYPES = [("AutoCPV Session", "*.autocpv.json"), ("JSON", "*.json")]
 DEFAULT_FACEBOOK_SEARCH = "https://www.facebook.com/search/top?q="
@@ -388,6 +388,7 @@ class FormFillerApp:
         style.configure("Body.TLabel", background=COLORS["paper"], foreground=COLORS["charcoal"], font=("Segoe UI", 10))
         style.configure("Status.TLabel", background=COLORS["cream"], foreground=COLORS["charcoal"], font=("Segoe UI Semibold", 10))
         style.configure("Neutral.TButton", font=("Segoe UI Semibold", 10))
+        style.configure("Accent.Horizontal.TProgressbar", troughcolor=COLORS["cream"], background=COLORS["red"], bordercolor=COLORS["line"], lightcolor=COLORS["red"], darkcolor=COLORS["red"])
         style.configure("Treeview", rowheight=28, font=("Segoe UI", 10), fieldbackground="white", background="white", foreground=COLORS["charcoal"])
         style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
         style.map("Treeview", background=[("selected", COLORS["red"])], foreground=[("selected", "white")])
@@ -447,6 +448,8 @@ class FormFillerApp:
         self.make_help_button(controls_card, "Desfer eliminació", self.undo_delete_record, "Recupera l'última fila eliminada.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Buscar a Google", self.open_google_search, "Busca l'activitat actual a Google.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Buscar font", self.open_source_helper, "Ajuda a trobar una font si encara no en tens.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Primera font", self.apply_google_first_result_to_selected, "Guarda la primera web de Google en la fila actual.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Primera font a totes", self.apply_google_first_result_to_all, "Prova d'omplir la font de totes les files amb el primer resultat.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Obrir font", self.open_source, "Obri l'enllaç de la font guardada.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Enviar fila seleccionada", self.submit_selected, "Envia només la fila actual al formulari.").pack(side="right", padx=4)
         self.make_help_button(controls_card, "Enviar-les totes", self.submit_all, "Envia totes les files preparades al formulari.").pack(side="right", padx=4)
@@ -941,6 +944,28 @@ class FormFillerApp:
         box.insert("1.0", "\n".join(f"{combo}: {desc}" for combo, desc in shortcuts))
         box.configure(state="disabled")
 
+    def open_progress_window(self, title: str, total: int):
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.geometry("460x150")
+        window.resizable(False, False)
+        window.configure(bg=COLORS["paper"])
+        window.transient(self.root)
+        window.grab_set()
+
+        outer = tk.Frame(window, bg=COLORS["paper"], padx=18, pady=18)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text=title, bg=COLORS["paper"], fg=COLORS["red"], font=("Segoe UI Semibold", 13), anchor="w").pack(fill="x")
+        status_var = tk.StringVar(value="Preparant procés...")
+        tk.Label(outer, textvariable=status_var, bg=COLORS["paper"], fg=COLORS["charcoal"], font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=(10, 8))
+        progress_var = tk.DoubleVar(value=0)
+        progress = ttk.Progressbar(outer, variable=progress_var, maximum=max(total, 1), style="Accent.Horizontal.TProgressbar", length=400)
+        progress.pack(fill="x")
+        count_var = tk.StringVar(value=f"0 / {total}")
+        tk.Label(outer, textvariable=count_var, bg=COLORS["paper"], fg=COLORS["muted"], font=("Segoe UI", 9), anchor="e").pack(fill="x", pady=(8, 0))
+        window.update_idletasks()
+        return window, progress_var, status_var, count_var
+
     def focus_editor(self):
         for key in ("nom", "font", "localitat", "data"):
             widget = self.editor_widgets.get(key)
@@ -1295,6 +1320,25 @@ class FormFillerApp:
     def build_search_query(self, record: Record):
         return " ".join(part for part in [record.nom, record.companyia, record.localitat] if part).strip()
 
+    def build_google_lucky_url(self, query: str):
+        return "https://www.google.com/search?btnI=I&q=" + urllib.parse.quote(query)
+
+    def resolve_google_first_result(self, query: str):
+        if not query.strip():
+            return ""
+        request = urllib.request.Request(
+            self.build_google_lucky_url(query),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.geturl()
+
     def open_google_search(self):
         if self.current_index is None:
             return
@@ -1303,6 +1347,99 @@ class FormFillerApp:
         query = self.build_search_query(record)
         if query:
             webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote(query))
+
+    def apply_google_first_result_to_selected(self):
+        if self.current_index is None:
+            messagebox.showinfo("Sense selecció", "Selecciona una fila.")
+            return
+        self.apply_current_record(silent=True)
+        record = self.records[self.current_index]
+        query = self.build_search_query(record)
+        if not query:
+            messagebox.showwarning("Sense dades", "Esta fila no té prou dades per buscar una font.")
+            return
+        try:
+            source_url = self.resolve_google_first_result(query)
+        except Exception as exc:
+            messagebox.showerror("Error buscant la font", str(exc))
+            return
+        if not source_url:
+            messagebox.showwarning("Sense resultat", "Google no ha retornat cap resultat usable.")
+            return
+
+        record.font = source_url
+        if self.current_index is not None:
+            self.suspend_dirty = True
+            try:
+                self.editor_vars["font"].set(source_url)
+            finally:
+                self.suspend_dirty = False
+        self.dirty = False
+        self.refresh_tree()
+        self.update_validation_message()
+        self.set_status("Primera font guardada en la fila actual.")
+        self.append_history(f"Font automàtica guardada per a: {record.nom or 'fila seleccionada'}")
+
+    def apply_google_first_result_to_all(self):
+        if not self.records:
+            messagebox.showwarning("Sense files", "Carrega primer un Excel.")
+            return
+
+        updated = 0
+        failed = 0
+        progress_window, progress_var, progress_status_var, progress_count_var = self.open_progress_window("Buscant fonts automàtiques", len(self.records))
+        try:
+            for index, record in enumerate(self.records, start=1):
+                label = record.nom.strip() or f"fila {index}"
+                progress_status_var.set(f"Processant {label}...")
+                progress_count_var.set(f"{index - 1} / {len(self.records)}")
+                progress_window.update()
+
+                query = self.build_search_query(record)
+                if not query:
+                    failed += 1
+                    progress_var.set(index)
+                    progress_count_var.set(f"{index} / {len(self.records)}")
+                    progress_window.update()
+                    continue
+                try:
+                    source_url = self.resolve_google_first_result(query)
+                except Exception:
+                    failed += 1
+                    progress_var.set(index)
+                    progress_count_var.set(f"{index} / {len(self.records)}")
+                    progress_window.update()
+                    continue
+                if not source_url:
+                    failed += 1
+                    progress_var.set(index)
+                    progress_count_var.set(f"{index} / {len(self.records)}")
+                    progress_window.update()
+                    continue
+                record.font = source_url
+                updated += 1
+                if self.current_index == index - 1:
+                    self.suspend_dirty = True
+                    try:
+                        self.editor_vars["font"].set(source_url)
+                    finally:
+                        self.suspend_dirty = False
+                    self.dirty = False
+                progress_var.set(index)
+                progress_count_var.set(f"{index} / {len(self.records)}")
+                progress_window.update()
+        finally:
+            try:
+                progress_window.grab_release()
+                progress_window.destroy()
+            except Exception:
+                pass
+
+        self.refresh_tree()
+        self.update_validation_message()
+        self.set_status(f"Fonts automàtiques aplicades a {updated} files.")
+        self.append_history(f"Fonts automàtiques aplicades a {updated} files; sense resultat en {failed}.")
+        messagebox.showinfo("Procés completat", f"Fonts aplicades: {updated}\nSense resultat: {failed}")
 
     def open_source_helper(self):
         if self.current_index is None:
