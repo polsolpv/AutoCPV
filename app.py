@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import tkinter as tk
+import unicodedata
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -19,8 +20,8 @@ from pypdf import PdfReader, PdfWriter
 
 
 APP_NAME = "AutoCPV"
-APP_VERSION = "1.3"
-DEFAULT_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSe4bZ7PPgQK66LOBgXMc5gCG11p02ueQXB9glD2i4mvivJtXQ/viewform"
+APP_VERSION = "1.4"
+DEFAULT_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLScdmuAuYu918Iv28w3v94kjs_uW2vyRSOAubcrnaWIyQTuQXA/viewform"
 SESSION_FILETYPES = [("AutoCPV Session", "*.autocpv.json"), ("JSON", "*.json")]
 DEFAULT_FACEBOOK_SEARCH = "https://www.facebook.com/search/top?q="
 LOGO_PATH = Path(r"C:\Users\solso\Documents\New project\assets\logo-trimmed.png")
@@ -98,9 +99,9 @@ CATEGORIA_OPTIONS = [
 LLENGUA_ACTIVITY_OPTIONS = [
     "Valencià/català",
     "Espanyol",
-    "Bilingüe",
     "Anglès",
-    "Altres",
+    "Francès",
+    "Activitat sense llengua",
     "No hi ha informació",
 ]
 REGIDORIA_OPTIONS = [
@@ -146,6 +147,14 @@ FIELD_OPTIONS = {
     "persona": PERSON_OPTIONS,
 }
 
+MASS_EDIT_FIELDS = {
+    "Llengua de l'activitat": "llengua",
+    "Categoria": "categoria",
+    "Regidoria organitzadora": "regidoria",
+    "Llengua de la publicitat": "publicitat",
+    "Persona": "persona",
+}
+
 LONG_TEXT_FIELDS = {"nom", "companyia", "lloc", "font", "altres"}
 
 COLORS = {
@@ -187,6 +196,13 @@ class Record:
 def normalize_label(text: str) -> str:
     text = text.replace("\xa0", " ").strip()
     return re.sub(r"\s+", " ", text)
+
+
+def normalize_form_key(text: str) -> str:
+    text = html.unescape(text or "")
+    text = normalize_label(text).casefold()
+    text = "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", text)
 
 
 def find_header_row(worksheet):
@@ -276,11 +292,15 @@ def extract_form_metadata(form_url: str):
         html_text = response.read().decode("utf-8", errors="ignore")
 
     field_ids = FALLBACK_FIELD_IDS.copy()
-    for key, label in FIELD_LABELS.items():
-        pattern = re.compile(rf'\[\d+,"{re.escape(label)}".*?\[\[(\d+),', re.DOTALL)
-        match = pattern.search(html_text)
-        if match:
-            field_ids[key] = match.group(1)
+    normalized_field_labels = {normalize_form_key(label): key for key, label in FIELD_LABELS.items()}
+    data_params_pattern = re.compile(r'data-params="%\.\@\.\[(\d+),&quot;(.*?)&quot;,null,\d+,\[\[(\d+),', re.DOTALL)
+    for match in data_params_pattern.finditer(html_text):
+        raw_label = match.group(2)
+        field_id = match.group(3)
+        normalized_label = normalize_form_key(raw_label)
+        key = normalized_field_labels.get(normalized_label)
+        if key:
+            field_ids[key] = field_id
 
     form_action_match = re.search(r'<form[^>]*action="([^"]+)"', html_text)
     if form_action_match:
@@ -335,8 +355,12 @@ class FormFillerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1540x980")
-        self.root.minsize(1320, 780)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = min(1540, max(1100, screen_width - 80))
+        window_height = min(980, max(720, screen_height - 100))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(1050, 680)
         self.root.configure(bg=COLORS["cream"])
 
         self.records = []
@@ -358,6 +382,8 @@ class FormFillerApp:
         self.person_var = tk.StringVar(value="Pol")
         self.fallback_font_var = tk.StringVar(value="")
         self.status_filter_var = tk.StringVar(value="Totes")
+        self.mass_edit_field_var = tk.StringVar(value="Llengua de l'activitat")
+        self.mass_edit_value_var = tk.StringVar(value=LLENGUA_ACTIVITY_OPTIONS[0])
         self.status_var = tk.StringVar(value="A punt.")
         self.validation_var = tk.StringVar(value="Sense validacions pendents.")
         self.editor_vars = {key: tk.StringVar() for key in FIELD_LABELS}
@@ -444,8 +470,8 @@ class FormFillerApp:
         controls_card = ttk.Frame(controls, style="Card.TFrame", padding=10)
         controls_card.pack(fill="x")
         self.make_help_button(controls_card, "Aplicar canvis", self.apply_current_record, "Guarda manualment els canvis de la fila actual.").pack(side="left", padx=4)
-        self.make_help_button(controls_card, "Eliminar fila", self.delete_current_record, "Esborra completament la fila seleccionada.").pack(side="left", padx=4)
-        self.make_help_button(controls_card, "Desfer eliminació", self.undo_delete_record, "Recupera l'última fila eliminada.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Eliminar fila", self.delete_current_record, "Esborra completament les files seleccionades.").pack(side="left", padx=4)
+        self.make_help_button(controls_card, "Desfer eliminació", self.undo_delete_record, "Recupera l'última eliminació de files.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Buscar a Google", self.open_google_search, "Busca l'activitat actual a Google.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Buscar font", self.open_source_helper, "Ajuda a trobar una font si encara no en tens.").pack(side="left", padx=4)
         self.make_help_button(controls_card, "Primera font", self.apply_google_first_result_to_selected, "Guarda la primera web de Google en la fila actual.").pack(side="left", padx=4)
@@ -458,9 +484,9 @@ class FormFillerApp:
         body.pack(fill="both", expand=True, pady=(0, 10))
 
         left = ttk.Frame(body, style="Card.TFrame", padding=10)
-        right = ttk.Frame(body, style="Card.TFrame", padding=16)
+        right_outer = ttk.Frame(body, style="Card.TFrame", padding=0)
         body.add(left, weight=3)
-        body.add(right, weight=2)
+        body.add(right_outer, weight=2)
 
         filter_bar = ttk.Frame(left, style="Card.TFrame")
         filter_bar.pack(fill="x", pady=(0, 8))
@@ -470,8 +496,35 @@ class FormFillerApp:
         filter_combo.pack(side="right")
         filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_tree())
 
+        mass_edit_bar = ttk.Frame(left, style="Card.TFrame")
+        mass_edit_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(mass_edit_bar, text="EdiciÃ³ massiva", style="Section.TLabel").pack(side="left", padx=(0, 8))
+        mass_field_combo = ttk.Combobox(
+            mass_edit_bar,
+            textvariable=self.mass_edit_field_var,
+            values=list(MASS_EDIT_FIELDS.keys()),
+            width=24,
+            state="readonly",
+        )
+        mass_field_combo.pack(side="left", padx=4)
+        self.mass_edit_value_combo = ttk.Combobox(
+            mass_edit_bar,
+            textvariable=self.mass_edit_value_var,
+            values=FIELD_OPTIONS[MASS_EDIT_FIELDS[self.mass_edit_field_var.get()]],
+            width=38,
+            state="readonly",
+        )
+        self.mass_edit_value_combo.pack(side="left", padx=4)
+        mass_field_combo.bind("<<ComboboxSelected>>", self.on_mass_edit_field_change)
+        self.make_help_button(
+            mass_edit_bar,
+            "Aplicar a seleccionades",
+            self.apply_mass_edit_to_selection,
+            "Canvia este camp en totes les files seleccionades.",
+        ).pack(side="left", padx=4)
+
         columns = ("localitat", "data", "categoria", "nom", "preu", "font", "status")
-        self.tree = ttk.Treeview(left, columns=columns, show="headings", height=26)
+        self.tree = ttk.Treeview(left, columns=columns, show="headings", height=26, selectmode="extended")
         headings = {
             "localitat": "Localitat",
             "data": "Data",
@@ -498,10 +551,33 @@ class FormFillerApp:
         self.tree.tag_configure("invalid", background=COLORS["warning_bg"])
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Control-a>", self.select_all_visible_rows)
+        self.tree.bind("<Control-A>", self.select_all_visible_rows)
 
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         scrollbar.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scrollbar.set)
+
+        right_canvas = tk.Canvas(right_outer, bg=COLORS["paper"], highlightthickness=0)
+        right_scrollbar = ttk.Scrollbar(right_outer, orient="vertical", command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
+        right_canvas.pack(side="left", fill="both", expand=True)
+        right_scrollbar.pack(side="right", fill="y")
+
+        right = ttk.Frame(right_canvas, style="Card.TFrame", padding=16)
+        right_window = right_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        def resize_editor_canvas(_event=None):
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+            right_canvas.itemconfigure(right_window, width=right_canvas.winfo_width())
+
+        def scroll_editor(event):
+            right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        right.bind("<Configure>", resize_editor_canvas)
+        right_canvas.bind("<Configure>", resize_editor_canvas)
+        right_canvas.bind("<Enter>", lambda _event: right_canvas.bind_all("<MouseWheel>", scroll_editor))
+        right_canvas.bind("<Leave>", lambda _event: right_canvas.unbind_all("<MouseWheel>"))
 
         ttk.Label(right, text="Editor de fila", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         validation_label = tk.Label(
@@ -511,7 +587,7 @@ class FormFillerApp:
             fg=COLORS["charcoal"],
             justify="left",
             anchor="w",
-            wraplength=430,
+            wraplength=360,
             padx=10,
             pady=8,
         )
@@ -551,8 +627,8 @@ class FormFillerApp:
 
     def build_editor_widget(self, parent, key):
         if key in FIELD_OPTIONS:
-            return ttk.Combobox(parent, textvariable=self.editor_vars[key], values=FIELD_OPTIONS[key], state="readonly", width=48)
-        width = 60 if key in {"nom", "companyia", "lloc", "font"} else 50
+            return ttk.Combobox(parent, textvariable=self.editor_vars[key], values=FIELD_OPTIONS[key], state="readonly", width=34)
+        width = 42 if key in {"nom", "companyia", "lloc", "font"} else 34
         return ttk.Entry(parent, textvariable=self.editor_vars[key], width=width)
 
     def make_help_button(self, parent, text, command, help_text):
@@ -927,6 +1003,7 @@ class FormFillerApp:
             ("Ctrl + D", "Aplicar font per defecte a totes"),
             ("Ctrl + E", "Portar el focus a l'editor"),
             ("Ctrl + T", "Portar el focus a la taula"),
+            ("Ctrl + A", "Seleccionar totes les files visibles de la taula"),
             ("Ctrl + Arriba / Baix", "Canviar de fila"),
         ]
 
@@ -988,6 +1065,17 @@ class FormFillerApp:
         self.tree.focus(target)
         self.tree.see(target)
         self.on_tree_select(None)
+
+    def select_all_visible_rows(self, _event=None):
+        items = self.tree.get_children()
+        if not items:
+            return "break"
+        self.tree.selection_set(items)
+        self.tree.focus(items[0])
+        self.tree.see(items[0])
+        self.populate_editor(int(items[0]))
+        self.set_status(f"{len(items)} files seleccionades.")
+        return "break"
 
     def pick_excel(self):
         path = filedialog.askopenfilename(title="Selecciona un Excel", filetypes=[("Excel", "*.xlsx *.xlsm"), ("Tots", "*.*")])
@@ -1086,6 +1174,62 @@ class FormFillerApp:
     def apply_fallback_font_to_empty(self):
         self.apply_fallback_font(mode="empty")
 
+    def on_mass_edit_field_change(self, _event=None):
+        field_key = MASS_EDIT_FIELDS.get(self.mass_edit_field_var.get(), "llengua")
+        values = FIELD_OPTIONS.get(field_key, [])
+        self.mass_edit_value_combo.configure(values=values)
+        self.mass_edit_value_var.set(values[0] if values else "")
+
+    def selected_record_indexes(self):
+        indexes = []
+        for item in self.tree.selection():
+            try:
+                indexes.append(int(item))
+            except ValueError:
+                continue
+        return indexes
+
+    def apply_mass_edit_to_selection(self):
+        selected_indexes = self.selected_record_indexes()
+        if not selected_indexes:
+            messagebox.showinfo("Sense selecció", "Selecciona una o més files de la taula.")
+            return
+
+        field_key = MASS_EDIT_FIELDS.get(self.mass_edit_field_var.get())
+        value = self.mass_edit_value_var.get().strip()
+        if not field_key or not value:
+            messagebox.showwarning("Falta valor", "Tria un camp i un valor abans d'aplicar el canvi.")
+            return
+
+        if self.dirty:
+            self.apply_current_record(silent=True)
+
+        changed = 0
+        for index in selected_indexes:
+            if index < 0 or index >= len(self.records):
+                continue
+            record = self.records[index]
+            if getattr(record, field_key) == value:
+                continue
+            setattr(record, field_key, value)
+            record.status = "Pendent"
+            record.status_detail = ""
+            changed += 1
+
+        if self.current_index in selected_indexes:
+            self.suspend_dirty = True
+            try:
+                self.editor_vars[field_key].set(getattr(self.records[self.current_index], field_key))
+            finally:
+                self.suspend_dirty = False
+            self.dirty = False
+
+        self.refresh_tree(preserve_selection=True)
+        self.update_validation_message()
+        label = self.mass_edit_field_var.get()
+        self.set_status(f"{label} canviada en {changed} files seleccionades.")
+        self.append_history(f"Edició massiva: {label} = {value} en {changed} files.")
+
     def apply_fallback_font(self, mode: str):
         fallback_font = self.fallback_font_var.get().strip()
         if not fallback_font:
@@ -1132,10 +1276,11 @@ class FormFillerApp:
         self.set_status("Canvis guardats automàticament.")
 
     def refresh_tree(self, preserve_selection=True):
-        selected = None
+        selected_items = []
         if preserve_selection:
-            current_selection = self.tree.selection()
-            selected = current_selection[0] if current_selection else (str(self.current_index) if self.current_index is not None else None)
+            selected_items = list(self.tree.selection())
+            if not selected_items and self.current_index is not None:
+                selected_items = [str(self.current_index)]
 
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1156,12 +1301,15 @@ class FormFillerApp:
             self.validation_var.set("No hi ha files visibles amb el filtre actual.")
             return
 
-        if selected is None or selected not in self.tree.get_children():
-            selected = str(self.visible_indices[0])
-        self.tree.selection_set(selected)
-        self.tree.focus(selected)
-        self.tree.see(selected)
-        self.populate_editor(int(selected))
+        available_items = set(self.tree.get_children())
+        selected_items = [item for item in selected_items if item in available_items]
+        if not selected_items:
+            selected_items = [str(self.visible_indices[0])]
+        self.tree.selection_set(selected_items)
+        focused = selected_items[0]
+        self.tree.focus(focused)
+        self.tree.see(focused)
+        self.populate_editor(int(focused))
 
     def record_matches_filter(self, record: Record) -> bool:
         mode = FILTER_OPTIONS.get(self.status_filter_var.get(), "all")
@@ -1272,41 +1420,66 @@ class FormFillerApp:
         return errors
 
     def delete_current_record(self):
-        if self.current_index is None or not self.records:
-            messagebox.showinfo("Sense selecció", "Selecciona una fila per a eliminar.")
+        selected_indexes = self.selected_record_indexes()
+        if not selected_indexes and self.current_index is not None:
+            selected_indexes = [self.current_index]
+        selected_indexes = sorted(set(index for index in selected_indexes if 0 <= index < len(self.records)))
+        if not selected_indexes or not self.records:
+            messagebox.showinfo("Sense selecció", "Selecciona una o més files per a eliminar.")
             return
         self.apply_current_record(silent=True)
-        record = self.records[self.current_index]
-        description = record.nom or record.localitat or f"fila {self.current_index + 1}"
-        confirmed = messagebox.askyesno("Eliminar fila", f"Vols eliminar completament esta fila?\n\n{description}")
+        if len(selected_indexes) == 1:
+            record = self.records[selected_indexes[0]]
+            description = record.nom or record.localitat or f"fila {selected_indexes[0] + 1}"
+            message = f"Vols eliminar completament esta fila?\n\n{description}"
+        else:
+            preview = []
+            for index in selected_indexes[:5]:
+                record = self.records[index]
+                preview.append(f"- {record.nom or record.localitat or f'fila {index + 1}'}")
+            if len(selected_indexes) > 5:
+                preview.append(f"- ... i {len(selected_indexes) - 5} més")
+            description = f"{len(selected_indexes)} files"
+            message = "Vols eliminar completament estes files?\n\n" + "\n".join(preview)
+        confirmed = messagebox.askyesno("Eliminar fila", message)
         if not confirmed:
             return
 
-        deleted_index = self.current_index
-        deleted_record = self.records.pop(deleted_index)
-        self.last_deleted = (deleted_index, deleted_record)
+        deleted_records = []
+        for index in sorted(selected_indexes, reverse=True):
+            deleted_records.append((index, self.records.pop(index)))
+        deleted_records.reverse()
+        self.last_deleted = deleted_records
+        self.current_index = None
         self.refresh_tree()
-        self.append_history(f"Fila eliminada: {description}.")
+        self.append_history(f"Eliminació: {description}.")
         if self.records:
-            self.set_status("Fila eliminada correctament. Pots desfer-la.")
+            self.set_status(f"{len(deleted_records)} files eliminades correctament. Pots desfer-ho.")
         else:
-            self.set_status("Fila eliminada. Ja no queden registres carregats.")
+            self.set_status("Files eliminades. Ja no queden registres carregats.")
 
     def undo_delete_record(self):
         if not self.last_deleted:
             messagebox.showinfo("Sense canvis", "No hi ha cap eliminació recent per a desfer.")
             return
-        index, record = self.last_deleted
-        index = max(0, min(index, len(self.records)))
-        self.records.insert(index, record)
+        deleted_records = self.last_deleted
+        if isinstance(deleted_records, tuple):
+            deleted_records = [deleted_records]
+        restored_indexes = []
+        for index, record in sorted(deleted_records, key=lambda item: item[0]):
+            index = max(0, min(index, len(self.records)))
+            self.records.insert(index, record)
+            restored_indexes.append(index)
         self.last_deleted = None
         self.refresh_tree()
-        if str(index) in self.tree.get_children():
-            self.tree.selection_set(str(index))
-            self.tree.focus(str(index))
-            self.populate_editor(index)
-        self.append_history(f"Eliminació desfeta: {record.nom or record.localitat or 'fila'}")
-        self.set_status("Fila recuperada correctament.")
+        restored_items = [str(index) for index in restored_indexes if str(index) in self.tree.get_children()]
+        if restored_items:
+            self.tree.selection_set(restored_items)
+            self.tree.focus(restored_items[0])
+            self.tree.see(restored_items[0])
+            self.populate_editor(int(restored_items[0]))
+        self.append_history(f"Eliminació desfeta: {len(restored_indexes)} files recuperades.")
+        self.set_status(f"{len(restored_indexes)} files recuperades correctament.")
 
     def on_tree_select(self, _event):
         selection = self.tree.selection()
