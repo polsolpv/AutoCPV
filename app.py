@@ -3,28 +3,112 @@ import html
 import json
 import os
 import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
+import time
 import unicodedata
 import urllib.parse
 import urllib.request
+import urllib.error
 import webbrowser
-from io import BytesIO
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import openpyxl
+import pdfplumber
+from docx import Document
+from docx.enum.text import WD_BREAK
+from docx.shared import Pt
 from PIL import Image, ImageTk
-from pypdf import PdfReader, PdfWriter
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
 
 APP_NAME = "AutoCPV"
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 DEFAULT_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLScdmuAuYu918Iv28w3v94kjs_uW2vyRSOAubcrnaWIyQTuQXA/viewform"
+PDF24_OCR_EXE = Path(r"C:\Program Files\PDF24\pdf24-Ocr.exe")
+PDF24_WORKING_DIR = Path(r"C:\Program Files\PDF24")
+PROJECT_DIR = Path(r"C:\Users\solso\Documents\New project")
+PROMPT_FILENAME = "PROMPT AutoCPV.txt"
+LOGO_FILENAME = "logo-trimmed.png"
+NVIDIA_CHAT_COMPLETIONS_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+DEFAULT_NVIDIA_MODEL = "openai/gpt-oss-120b"
+DEFAULT_NVIDIA_MAX_TOKENS = 16000
+CONFIG_DIR = Path(os.environ.get("APPDATA", PROJECT_DIR)) / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "settings.json"
 SESSION_FILETYPES = [("AutoCPV Session", "*.autocpv.json"), ("JSON", "*.json")]
 DEFAULT_FACEBOOK_SEARCH = "https://www.facebook.com/search/top?q="
-LOGO_PATH = Path(r"C:\Users\solso\Documents\New project\assets\logo-trimmed.png")
+LOGO_PATH = PROJECT_DIR / "assets" / LOGO_FILENAME
+
+
+def app_search_dirs() -> list[Path]:
+    dirs = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        dirs.extend([exe_dir, exe_dir.parent])
+    bundle_root = getattr(sys, "_MEIPASS", "")
+    if bundle_root:
+        bundle_dir = Path(bundle_root)
+        dirs.extend([bundle_dir, bundle_dir / "assets"])
+    dirs.extend([PROJECT_DIR, Path(__file__).resolve().parent, Path.cwd()])
+    unique_dirs = []
+    for folder in dirs:
+        if folder not in unique_dirs:
+            unique_dirs.append(folder)
+    return unique_dirs
+
+
+def resolve_prompt_path() -> Path:
+    for folder in app_search_dirs():
+        candidate = folder / PROMPT_FILENAME
+        if candidate.exists():
+            return candidate
+    return PROJECT_DIR / PROMPT_FILENAME
+
+
+def resolve_asset_path(filename: str) -> Path:
+    for folder in app_search_dirs():
+        candidates = [folder / filename, folder / "assets" / filename]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    return PROJECT_DIR / "assets" / filename
+
+
+def resolve_pdf24_ocr_exe() -> Path:
+    candidates = [
+        PDF24_OCR_EXE,
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "PDF24" / "pdf24-Ocr.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "PDF24" / "pdf24-Ocr.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return PDF24_OCR_EXE
+
+
+def load_app_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_app_config(config: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 FIELD_LABELS = {
     "localitat": "Localitat",
@@ -193,6 +277,129 @@ class Record:
     status_detail: str = ""
 
 
+@dataclass
+class OCRPage:
+    number: int
+    text: str
+
+
+class OCRCancelled(Exception):
+    pass
+
+
+def structured_page_text(page) -> str:
+    words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False)
+    if not words:
+        return (page.extract_text() or "").strip()
+
+    words = sorted(words, key=lambda item: (round(item["top"], 1), item["x0"]))
+    lines = []
+    for word in words:
+        top = word["top"]
+        bottom = word["bottom"]
+        height = bottom - top
+        if not lines:
+            lines.append({"top": top, "bottom": bottom, "words": [word]})
+            continue
+        previous = lines[-1]
+        tolerance = max(3.0, min(height, previous["bottom"] - previous["top"]) * 0.55)
+        if abs(top - previous["top"]) <= tolerance:
+            previous["words"].append(word)
+            previous["bottom"] = max(previous["bottom"], bottom)
+        else:
+            lines.append({"top": top, "bottom": bottom, "words": [word]})
+
+    text_lines = []
+    heights = [line["bottom"] - line["top"] for line in lines]
+    median_height = statistics.median(heights) if heights else 12
+    previous_bottom = None
+
+    for line in lines:
+        ordered_words = sorted(line["words"], key=lambda item: item["x0"])
+        average_char_widths = [
+            (item["x1"] - item["x0"]) / max(len(item["text"]), 1)
+            for item in ordered_words
+            if item["text"]
+        ]
+        average_char_width = statistics.mean(average_char_widths) if average_char_widths else 6
+
+        chunks = []
+        previous_word = None
+        for word in ordered_words:
+            if previous_word is not None:
+                gap = word["x0"] - previous_word["x1"]
+                chunks.append("    " if gap > average_char_width * 5 else " ")
+            chunks.append(word["text"])
+            previous_word = word
+
+        if previous_bottom is not None and line["top"] - previous_bottom > median_height * 0.9:
+            text_lines.append("")
+        text_lines.append("".join(chunks).strip())
+        previous_bottom = line["bottom"]
+
+    return "\n".join(text_lines).strip()
+
+
+def extract_document_pages(pdf_path: Path) -> list[OCRPage]:
+    pages = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            pages.append(OCRPage(number=page_number, text=structured_page_text(page)))
+    return pages
+
+
+def export_docx(pages: list[OCRPage], output_path: Path):
+    document = Document()
+    normal_style = document.styles["Normal"]
+    normal_style.font.name = "Calibri"
+    normal_style.font.size = Pt(11)
+
+    for page_index, page in enumerate(pages):
+        blocks = [block.strip() for block in page.text.split("\n\n")]
+        for block in blocks:
+            paragraph = document.add_paragraph()
+            lines = [line.rstrip() for line in block.splitlines() if line.strip() or len(blocks) == 1]
+            for index, line in enumerate(lines):
+                run = paragraph.add_run(line)
+                if index < len(lines) - 1:
+                    run.add_break(WD_BREAK.LINE)
+        if page_index < len(pages) - 1:
+            document.add_page_break()
+
+    document.save(output_path)
+
+
+def export_clean_pdf(pages: list[OCRPage], output_path: Path):
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle(
+        "CleanText",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=11,
+        leading=15,
+        spaceAfter=8,
+    )
+    story = []
+    for page_index, page in enumerate(pages):
+        blocks = [block.strip() for block in page.text.split("\n\n") if block.strip()]
+        for block in blocks:
+            escaped = "<br/>".join(html.escape(line) for line in block.splitlines())
+            story.append(Paragraph(escaped, normal))
+            story.append(Spacer(1, 6))
+        if page_index < len(pages) - 1:
+            story.append(PageBreak())
+
+    document = SimpleDocTemplate(
+        str(output_path),
+        pagesize=A4,
+        leftMargin=52,
+        rightMargin=52,
+        topMargin=52,
+        bottomMargin=52,
+    )
+    document.build(story)
+
+
 def normalize_label(text: str) -> str:
     text = text.replace("\xa0", " ").strip()
     return re.sub(r"\s+", " ", text)
@@ -279,6 +486,243 @@ def load_excel_records(path: str, default_person: str, fallback_font: str):
             record.persona = default_person.strip() or "Pol"
         records.append(record)
     return records
+
+
+def autocpv_excel_headers():
+    return [FIELD_LABELS[key] for key in FIELD_LABELS]
+
+
+def pages_to_prompt_text(pages: list[OCRPage]) -> str:
+    chunks = []
+    for page in pages:
+        chunks.append(f"--- Pàgina {page.number} ---\n{page.text.strip()}")
+    return "\n\n".join(chunks).strip()
+
+
+def build_autocpv_json_schema():
+    row_properties = {key: {"type": "string", "description": FIELD_LABELS[key]} for key in FIELD_LABELS}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["rows", "report"],
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": list(FIELD_LABELS.keys()),
+                    "properties": row_properties,
+                },
+            },
+            "report": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["localitat", "pages_reviewed", "total_pages", "activities_detected", "rows_generated", "discarded"],
+                "properties": {
+                    "localitat": {"type": "string"},
+                    "pages_reviewed": {"type": "integer"},
+                    "total_pages": {"type": "integer"},
+                    "activities_detected": {"type": "integer"},
+                    "rows_generated": {"type": "integer"},
+                    "discarded": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name", "reason", "page"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "page": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+def response_output_text(payload: dict) -> str:
+    if payload.get("output_text"):
+        return payload["output_text"]
+    parts = []
+    for item in payload.get("output", []):
+        for content in item.get("content", []):
+            text = content.get("text")
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def chat_completion_text(payload: dict) -> str:
+    choices = payload.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, list):
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return str(content or "").strip()
+
+
+def parse_json_response(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
+
+
+def post_nvidia_chat(messages: list[dict], api_key: str, model: str, max_tokens: int, temperature: float = 0.1) -> dict:
+    request_payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": 1,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    request = urllib.request.Request(
+        NVIDIA_CHAT_COMPLETIONS_URL,
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=420) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"NVIDIA ha retornat un error HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"No s'ha pogut connectar amb NVIDIA: {exc}") from exc
+
+
+def repair_json_with_nvidia(raw_text: str, api_key: str, model: str, max_tokens: int, progress_callback=None) -> dict:
+    if progress_callback:
+        progress_callback("La resposta no era JSON valid. Intentant reparar-la automaticament...")
+    schema_text = json.dumps(build_autocpv_json_schema(), ensure_ascii=False)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un reparador de JSON. Devuelve exclusivamente un objeto JSON valido. "
+                "No anadas Markdown, comentarios ni explicaciones."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Repara el siguiente texto para que sea JSON valido y cumpla este esquema. "
+                "Conserva todas las filas de actividades que puedas sin inventar datos nuevos.\n\n"
+                f"ESQUEMA:\n{schema_text}\n\n"
+                f"TEXTO A REPARAR:\n{raw_text}"
+            ),
+        },
+    ]
+    repaired_payload = post_nvidia_chat(messages, api_key, model, max_tokens, temperature=0)
+    repaired_text = chat_completion_text(repaired_payload)
+    if not repaired_text:
+        raise RuntimeError("NVIDIA no ha retornat text en l'intent de reparacio JSON.")
+    return parse_json_response(repaired_text)
+
+
+def call_ai_for_autocpv(prompt_text: str, ocr_text: str, api_key: str, progress_callback=None, model: str | None = None, max_tokens: int | None = None):
+    model = model or os.environ.get("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL)
+    max_tokens = max_tokens or int(os.environ.get("NVIDIA_MAX_TOKENS", str(DEFAULT_NVIDIA_MAX_TOKENS)))
+    system_text = (
+        "Eres un extractor de actividades culturales para AutoCPV. "
+        "Devuelve exclusivamente JSON válido que cumpla el esquema. "
+        "No escribas Markdown ni explicaciones fuera del JSON. "
+        "Antes de finalizar, comprueba que el JSON se puede parsear con json.loads."
+    )
+    integration_text = (
+        "INSTRUCCIÓN DE INTEGRACIÓN: aunque el prompt pida crear un Excel, en esta aplicación debes devolver JSON "
+        "con las claves exactas del esquema. AutoCPV creará el Excel después. "
+        "Las fechas deben ir en formato YYYY-MM-DD para que AutoCPV las convierta en fechas reales de Excel."
+    )
+    schema_text = json.dumps(build_autocpv_json_schema(), ensure_ascii=False)
+    user_text = (
+        f"{prompt_text}\n\n{integration_text}\n\n"
+        f"ESQUEMA JSON OBLIGATORIO:\n{schema_text}\n\n"
+        f"TEXT OCR DEL PDF:\n{ocr_text}"
+    )
+    request_payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.2,
+        "top_p": 1,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    if progress_callback:
+        progress_callback(f"Enviant text OCR a NVIDIA ({model}, max_tokens={max_tokens})...")
+    response_payload = post_nvidia_chat(request_payload["messages"], api_key, model, max_tokens, temperature=0.2)
+
+    output_text = chat_completion_text(response_payload)
+    if not output_text:
+        raise RuntimeError("NVIDIA no ha retornat text estructurat.")
+    try:
+        return parse_json_response(output_text)
+    except json.JSONDecodeError as exc:
+        try:
+            return repair_json_with_nvidia(output_text, api_key, model, max_tokens, progress_callback)
+        except json.JSONDecodeError as repair_exc:
+            raise RuntimeError(f"La resposta de NVIDIA no es JSON valid: {repair_exc}") from exc
+
+
+def coerce_excel_date(value):
+    if not value:
+        return ""
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return text
+
+
+def write_autocpv_excel(rows: list[dict], output_path: Path):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Activitats"
+    worksheet.append(autocpv_excel_headers())
+    for row_data in rows:
+        values = []
+        for key in FIELD_LABELS:
+            value = row_data.get(key, "")
+            if key == "data":
+                value = coerce_excel_date(value)
+            values.append(value)
+        worksheet.append(values)
+    for cell in worksheet[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    date_col = list(FIELD_LABELS.keys()).index("data") + 1
+    for row in worksheet.iter_rows(min_row=2, min_col=date_col, max_col=date_col):
+        for cell in row:
+            if isinstance(cell.value, dt.date):
+                cell.number_format = "dd/mm/yyyy"
+    for column_cells in worksheet.columns:
+        max_length = max(len(str(cell.value or "")) for cell in column_cells)
+        worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 42)
+    workbook.save(output_path)
 
 
 def extract_form_metadata(form_url: str):
@@ -376,6 +820,17 @@ class FormFillerApp:
         self.history_entries = []
         self.editor_widgets = {}
         self.help_popup = None
+        self.closing = False
+        self.after_ids = set()
+        self.source_pdf = None
+        self.ocr_pdf = None
+        self.ocr_pages = []
+        self.ocr_current_page_index = None
+        self.ocr_dirty = False
+        self.ocr_suspend_dirty = False
+        self.pdf24_process = None
+        self.config_data = load_app_config()
+        ai_config = self.config_data.get("ai", {}) if isinstance(self.config_data.get("ai", {}), dict) else {}
 
         self.excel_path_var = tk.StringVar()
         self.form_url_var = tk.StringVar(value=DEFAULT_FORM_URL)
@@ -387,17 +842,22 @@ class FormFillerApp:
         self.status_var = tk.StringVar(value="A punt.")
         self.validation_var = tk.StringVar(value="Sense validacions pendents.")
         self.editor_vars = {key: tk.StringVar() for key in FIELD_LABELS}
-        self.split_pdf_path_var = tk.StringVar()
-        self.split_output_dir_var = tk.StringVar()
-        self.split_status_var = tk.StringVar(value="A punt per a dividir PDFs OCR.")
-        self.split_summary_var = tk.StringVar(value="Encara no hi ha cap PDF carregat.")
-        self.split_progress_var = tk.DoubleVar(value=0.0)
-        self.split_result_cards = []
+        self.ocr_pdf_path_var = tk.StringVar()
+        self.ocr_result_path_var = tk.StringVar(value="Encara no s'ha generat.")
+        self.ocr_status_var = tk.StringVar(value="A punt per a processar PDFs.")
+        self.ocr_summary_var = tk.StringVar(value="Selecciona un PDF per començar.")
+        self.ocr_progress_var = tk.DoubleVar(value=0.0)
+        self.ocr_localitat_var = tk.StringVar()
+        self.ocr_font_var = tk.StringVar()
+        self.nvidia_api_key_var = tk.StringVar(value=ai_config.get("nvidia_api_key") or os.environ.get("NVIDIA_API_KEY", ""))
+        self.nvidia_model_var = tk.StringVar(value=ai_config.get("nvidia_model") or os.environ.get("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL))
+        self.nvidia_max_tokens_var = tk.StringVar(value=str(ai_config.get("nvidia_max_tokens") or os.environ.get("NVIDIA_MAX_TOKENS", DEFAULT_NVIDIA_MAX_TOKENS)))
 
         self.configure_styles()
         self.build_ui()
         self.bind_editor_events()
         self.bind_shortcuts()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.show_splash()
 
     def configure_styles(self):
@@ -435,9 +895,9 @@ class FormFillerApp:
         self.notebook = ttk.Notebook(notebook_wrap)
         self.notebook.pack(fill="both", expand=True)
         self.main_tab = ttk.Frame(self.notebook, style="Root.TFrame")
-        self.splitter_tab = ttk.Frame(self.notebook, style="Root.TFrame")
+        self.ocr_tab = ttk.Frame(self.notebook, style="Root.TFrame")
         self.notebook.add(self.main_tab, text="Formularis")
-        self.notebook.add(self.splitter_tab, text="Divisor PDF OCR")
+        self.notebook.add(self.ocr_tab, text="OCR de PDFs")
 
         top = ttk.Frame(self.main_tab, style="Root.TFrame", padding=(0, 0, 0, 8))
         top.pack(fill="x")
@@ -620,7 +1080,7 @@ class FormFillerApp:
         right.columnconfigure(1, weight=1)
         right.rowconfigure(row_index, weight=1)
 
-        self.build_splitter_tab()
+        self.build_ocr_tab()
 
         status = ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", padding=(16, 0, 16, 12))
         status.pack(fill="x")
@@ -636,16 +1096,16 @@ class FormFillerApp:
         button.bind("<Button-3>", lambda event, msg=help_text: self.show_button_help(event, msg))
         return button
 
-    def build_splitter_tab(self):
-        outer = ttk.Frame(self.splitter_tab, style="Root.TFrame", padding=(0, 0, 0, 10))
+    def build_ocr_tab(self):
+        outer = ttk.Frame(self.ocr_tab, style="Root.TFrame", padding=(0, 0, 0, 10))
         outer.pack(fill="both", expand=True)
 
         hero_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
         hero_card.pack(fill="x", pady=(0, 10))
-        ttk.Label(hero_card, text="Divisor PDF OCR", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(hero_card, text="OCR de PDFs", style="Section.TLabel").pack(anchor="w")
         ttk.Label(
             hero_card,
-            text="Divideix PDFs grans en parts de fins a 24 MB per poder-los compartir o pujar més fàcilment.",
+            text="Processa un PDF amb OCR, revisa el text per pàgines i exporta una versió neta a DOCX o PDF.",
             style="Body.TLabel",
             wraplength=1100,
             justify="left",
@@ -653,71 +1113,93 @@ class FormFillerApp:
 
         top_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
         top_card.pack(fill="x")
-
-        ttk.Label(top_card, text="PDF OCR", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top_card, textvariable=self.split_pdf_path_var, width=92).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(top_card, text="Buscar PDF", command=self.pick_split_pdf, style="Neutral.TButton").grid(row=0, column=2, padx=4)
-
-        ttk.Label(top_card, text="Carpeta d'eixida", style="Section.TLabel").grid(row=1, column=0, sticky="w")
-        ttk.Entry(top_card, textvariable=self.split_output_dir_var, width=92).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(top_card, text="Buscar carpeta", command=self.pick_split_output_dir, style="Neutral.TButton").grid(row=1, column=2, padx=4)
-        ttk.Button(top_card, text="Dividir a 24 MB", command=self.run_split_pdf, style="Neutral.TButton").grid(row=1, column=3, padx=4)
+        ttk.Label(top_card, text="PDF origen", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top_card, textvariable=self.ocr_pdf_path_var, width=92).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(top_card, text="Buscar PDF", command=self.pick_ocr_pdf, style="Neutral.TButton").grid(row=0, column=2, padx=4)
+        ttk.Button(top_card, text="Obrir OCR en PDF24", command=self.process_ocr_pdf, style="Neutral.TButton").grid(row=0, column=3, padx=4)
+        ttk.Button(top_card, text="Cancel·lar / netejar", command=self.cancel_ocr_process, style="Neutral.TButton").grid(row=0, column=4, padx=4)
+        ttk.Label(top_card, text="PDF OCR", style="Section.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Entry(top_card, textvariable=self.ocr_result_path_var, width=92, state="readonly").grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(top_card, text="Obrir PDF OCR", command=self.open_ocr_pdf, style="Neutral.TButton").grid(row=1, column=2, padx=4)
+        ttk.Button(top_card, text="Carregar PDF OCR", command=self.pick_generated_ocr_pdf, style="Neutral.TButton").grid(row=1, column=3, padx=4)
+        ttk.Button(top_card, text="Reextraure text", command=self.reload_text_from_ocr, style="Neutral.TButton").grid(row=1, column=4, padx=4)
+        ttk.Label(top_card, text="Localitat", style="Section.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Entry(top_card, textvariable=self.ocr_localitat_var, width=28).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(top_card, text="Font", style="Section.TLabel").grid(row=2, column=1, sticky="e")
+        ttk.Entry(top_card, textvariable=self.ocr_font_var, width=42).grid(row=2, column=2, columnspan=3, sticky="ew", padx=8, pady=4)
         top_card.columnconfigure(1, weight=1)
-
-        drop_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        drop_card.pack(fill="x", pady=(10, 0))
-        self.drop_zone = tk.Label(
-            drop_card,
-            text="Arrossega ací un PDF OCR o fes clic per a seleccionar-lo",
-            bg=COLORS["rose"],
-            fg=COLORS["charcoal"],
-            font=("Segoe UI Semibold", 11),
-            padx=20,
-            pady=20,
-            relief="flat",
-            cursor="hand2",
-        )
-        self.drop_zone.pack(fill="x")
-        self.drop_zone.bind("<Button-1>", lambda _event: self.pick_split_pdf())
-        self.enable_drop_support()
 
         summary_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
         summary_card.pack(fill="x", pady=(10, 0))
         ttk.Label(summary_card, text="Resum", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(summary_card, textvariable=self.split_summary_var, style="Body.TLabel", wraplength=1100, justify="left").pack(anchor="w", pady=(6, 10))
-        self.split_progress = ttk.Progressbar(summary_card, maximum=100, variable=self.split_progress_var)
-        self.split_progress.pack(fill="x")
-        self.open_output_button = ttk.Button(summary_card, text="Obrir carpeta d'eixida", command=self.open_split_output_dir, style="Neutral.TButton")
-        self.open_output_button.pack(anchor="e", pady=(10, 0))
+        ttk.Label(summary_card, textvariable=self.ocr_summary_var, style="Body.TLabel", wraplength=1100, justify="left").pack(anchor="w", pady=(6, 10))
+        self.ocr_progress = ttk.Progressbar(summary_card, maximum=100, variable=self.ocr_progress_var, style="Accent.Horizontal.TProgressbar")
+        self.ocr_progress.pack(fill="x")
 
-        info_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        info_card.pack(fill="both", expand=True, pady=(10, 0))
-        ttk.Label(info_card, text="Resultat del divisor", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
-        ttk.Label(
-            info_card,
-            text="La ferramenta divideix el PDF només per pes aproximat, sense interpretar el contingut. Si una pàgina sola supera el límit, es guardarà igual en una part pròpia.",
-            style="Body.TLabel",
-            wraplength=1100,
-            justify="left",
-        ).pack(anchor="w", pady=(0, 12))
+        controls = ttk.Frame(outer, style="Card.TFrame", padding=10)
+        controls.pack(fill="x", pady=(10, 0))
+        ttk.Button(controls, text="Aplicar canvis de pàgina", command=self.apply_current_ocr_page, style="Neutral.TButton").pack(side="left", padx=4)
+        ttk.Button(controls, text="Generar Excel amb ChatGPT", command=self.generate_excel_from_ocr_with_chatgpt, style="Neutral.TButton").pack(side="left", padx=4)
+        ttk.Button(controls, text="Configurar IA", command=self.open_ai_settings, style="Neutral.TButton").pack(side="left", padx=4)
+        ttk.Button(controls, text="Exportar a PDF net", command=self.export_ocr_to_pdf, style="Neutral.TButton").pack(side="right", padx=4)
+        ttk.Button(controls, text="Exportar a DOCX", command=self.export_ocr_to_docx, style="Neutral.TButton").pack(side="right", padx=4)
 
-        self.results_cards_frame = ttk.Frame(info_card, style="Card.TFrame")
-        self.results_cards_frame.pack(fill="x", pady=(0, 12))
+        body = ttk.PanedWindow(outer, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=(10, 0))
+        left = ttk.Frame(body, style="Card.TFrame", padding=10)
+        center = ttk.Frame(body, style="Card.TFrame", padding=10)
+        right = ttk.Frame(body, style="Card.TFrame", padding=10)
+        body.add(left, weight=2)
+        body.add(center, weight=5)
+        body.add(right, weight=2)
 
-        self.split_log_box = tk.Text(
-            info_card,
+        ttk.Label(left, text="Pàgines detectades", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.ocr_page_tree = ttk.Treeview(left, columns=("page", "preview"), show="headings", height=18)
+        self.ocr_page_tree.heading("page", text="Pàgina")
+        self.ocr_page_tree.heading("preview", text="Vista prèvia")
+        self.ocr_page_tree.column("page", width=70, anchor="w")
+        self.ocr_page_tree.column("preview", width=240, anchor="w")
+        self.ocr_page_tree.pack(side="left", fill="both", expand=True)
+        self.ocr_page_tree.bind("<<TreeviewSelect>>", self.on_ocr_page_select)
+        page_scroll = ttk.Scrollbar(left, orient="vertical", command=self.ocr_page_tree.yview)
+        page_scroll.pack(side="right", fill="y")
+        self.ocr_page_tree.configure(yscrollcommand=page_scroll.set)
+
+        ttk.Label(center, text="Editor de text", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.ocr_editor = tk.Text(
+            center,
             wrap="word",
-            font=("Consolas", 10),
+            undo=True,
+            font=("Consolas", 11),
             bg="white",
             fg=COLORS["charcoal"],
+            insertbackground=COLORS["red"],
             relief="flat",
             padx=12,
             pady=12,
         )
-        self.split_log_box.pack(fill="both", expand=True)
-        self.split_log_box.configure(state="disabled")
+        self.ocr_editor.pack(side="left", fill="both", expand=True)
+        self.ocr_editor.bind("<<Modified>>", self.on_ocr_editor_modified)
+        editor_scroll = ttk.Scrollbar(center, orient="vertical", command=self.ocr_editor.yview)
+        editor_scroll.pack(side="right", fill="y")
+        self.ocr_editor.configure(yscrollcommand=editor_scroll.set)
 
-        ttk.Label(outer, textvariable=self.split_status_var, style="Status.TLabel", padding=(0, 8, 0, 0)).pack(fill="x")
+        ttk.Label(right, text="Estat del procés", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.ocr_log_box = tk.Text(
+            right,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg="white",
+            fg=COLORS["charcoal"],
+            relief="flat",
+            height=18,
+            padx=10,
+            pady=10,
+        )
+        self.ocr_log_box.pack(fill="both", expand=True)
+        self.ocr_log_box.configure(state="disabled")
+
+        ttk.Label(outer, textvariable=self.ocr_status_var, style="Status.TLabel", padding=(0, 8, 0, 0)).pack(fill="x")
 
     def bind_editor_events(self):
         for variable in self.editor_vars.values():
@@ -740,7 +1222,8 @@ class FormFillerApp:
         self.root.bind("<Control-Down>", lambda _event: self.move_selection(1))
 
     def show_splash(self):
-        if not LOGO_PATH.exists():
+        logo_path = resolve_asset_path(LOGO_FILENAME)
+        if not logo_path.exists():
             return
         splash = tk.Toplevel(self.root)
         splash.overrideredirect(True)
@@ -756,7 +1239,7 @@ class FormFillerApp:
         frame = tk.Frame(splash, bg=COLORS["cream"], highlightbackground=COLORS["line"], highlightthickness=1)
         frame.pack(fill="both", expand=True)
 
-        image = Image.open(LOGO_PATH).convert("RGBA")
+        image = Image.open(logo_path).convert("RGBA")
         image.thumbnail((180, 180))
         self.logo_image = ImageTk.PhotoImage(image)
 
@@ -773,7 +1256,7 @@ class FormFillerApp:
                 self.root.lift()
                 try:
                     self.root.attributes("-topmost", True)
-                    self.root.after(120, lambda: self.root.attributes("-topmost", False))
+                    self.safe_after(120, lambda: self.root.attributes("-topmost", False))
                 except tk.TclError:
                     pass
                 self.root.focus_force()
@@ -784,9 +1267,9 @@ class FormFillerApp:
                 splash.destroy()
                 self.root.deiconify()
                 return
-            splash.after(55, lambda: animate(i + 1))
+            self.safe_after(55, lambda: animate(i + 1))
 
-        self.root.after(150, animate)
+        self.safe_after(150, animate)
 
     def now_stamp(self):
         return dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -831,154 +1314,383 @@ class FormFillerApp:
                 pass
             self.help_popup = None
 
-    def set_split_status(self, text):
-        self.split_status_var.set(text)
+    def safe_after(self, delay_ms, callback):
+        if self.closing:
+            return None
+        after_id = None
 
-    def append_split_log(self, text):
-        self.split_log_box.configure(state="normal")
-        self.split_log_box.insert("end", text + "\n")
-        self.split_log_box.see("end")
-        self.split_log_box.configure(state="disabled")
-
-    def set_split_progress(self, current, total):
-        percent = 0 if total <= 0 else (current / total) * 100
-        self.split_progress_var.set(percent)
-
-    def clear_split_results(self):
-        for widget in self.results_cards_frame.winfo_children():
-            widget.destroy()
-
-    def add_split_result_card(self, file_path: Path, pages_text: str):
-        size_mb = file_path.stat().st_size / (1024 * 1024)
-        card = tk.Frame(self.results_cards_frame, bg="white", highlightbackground=COLORS["line"], highlightthickness=1)
-        card.pack(fill="x", pady=5)
-        tk.Label(card, text=file_path.name, bg="white", fg=COLORS["red"], font=("Segoe UI Semibold", 11), anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-        tk.Label(card, text=f"{pages_text}  |  {size_mb:.2f} MB", bg="white", fg=COLORS["charcoal"], font=("Segoe UI", 10), anchor="w").pack(fill="x", padx=12, pady=(0, 10))
-
-    def open_split_output_dir(self):
-        path = self.split_output_dir_var.get().strip()
-        if path and Path(path).exists():
-            os.startfile(path)  # type: ignore[attr-defined]
-
-    def enable_drop_support(self):
-        try:
-            self.root.tk.call("package", "require", "tkdnd")
-            self.drop_zone.drop_target_register("DND_Files")
-            self.drop_zone.dnd_bind("<<Drop>>", self.on_drop_pdf)
-            self.drop_zone.configure(text="Arrossega ací un PDF OCR o fes clic per a seleccionar-lo")
-        except Exception:
-            self.drop_zone.configure(text="Fes clic ací per a seleccionar un PDF OCR")
-
-    def on_drop_pdf(self, event):
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            raw = raw[1:-1]
-        path = Path(raw)
-        if path.exists():
-            self.split_pdf_path_var.set(str(path))
-            default_output = path.with_name(f"{path.stem}_parts")
-            self.split_output_dir_var.set(str(default_output))
-            self.split_summary_var.set(f"PDF carregat: {path.name} | {path.stat().st_size / (1024 * 1024):.2f} MB")
-            self.set_split_status("PDF preparat per a dividir.")
-
-    def open_splitter_tab(self):
-        self.notebook.select(self.splitter_tab)
-
-    def pick_split_pdf(self):
-        path = filedialog.askopenfilename(title="Selecciona un PDF OCR", filetypes=[("PDF", "*.pdf"), ("Tots", "*.*")])
-        if path:
-            self.split_pdf_path_var.set(path)
-            source = Path(path)
-            default_output = source.with_name(f"{source.stem}_parts")
-            self.split_output_dir_var.set(str(default_output))
-            self.split_summary_var.set(f"PDF carregat: {source.name} | {source.stat().st_size / (1024 * 1024):.2f} MB")
-            self.split_progress_var.set(0)
-            self.set_split_status("PDF preparat per a dividir.")
-
-    def pick_split_output_dir(self):
-        path = filedialog.askdirectory(title="Selecciona carpeta d'eixida")
-        if path:
-            self.split_output_dir_var.set(path)
-
-    def run_split_pdf(self):
-        source_path = Path(self.split_pdf_path_var.get().strip())
-        output_dir = Path(self.split_output_dir_var.get().strip()) if self.split_output_dir_var.get().strip() else None
-        if not source_path.exists():
-            messagebox.showwarning("Falta el PDF", "Selecciona un PDF OCR vàlid.")
-            return
-        if output_dir is None:
-            output_dir = source_path.with_name(f"{source_path.stem}_parts")
-            self.split_output_dir_var.set(str(output_dir))
+        def run_callback():
+            self.after_ids.discard(after_id)
+            if self.closing:
+                return
+            try:
+                if self.root.winfo_exists():
+                    callback()
+            except tk.TclError:
+                pass
 
         try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            self.clear_split_results()
-            self.split_progress_var.set(0)
-            created = self.split_pdf_by_size(source_path, output_dir, max_size_mb=24)
-        except Exception as exc:
-            messagebox.showerror("Error dividint el PDF", str(exc))
-            self.set_split_status("No s'ha pogut dividir el PDF.")
-            return
+            after_id = self.root.after(delay_ms, run_callback)
+        except tk.TclError:
+            return None
+        self.after_ids.add(after_id)
+        return after_id
 
-        self.split_log_box.configure(state="normal")
-        self.split_log_box.delete("1.0", "end")
-        self.split_log_box.configure(state="disabled")
-        self.append_split_log(f"PDF original: {source_path}")
-        self.append_split_log(f"Carpeta d'eixida: {output_dir}")
-        for item, page_indexes in created:
-            size_mb = item.stat().st_size / (1024 * 1024)
-            self.append_split_log(f"- {item.name}: {size_mb:.2f} MB")
-            pages_text = f"Pàgines {page_indexes[0] + 1}-{page_indexes[-1] + 1}" if len(page_indexes) > 1 else f"Pàgina {page_indexes[0] + 1}"
-            self.add_split_result_card(item, pages_text)
-        original_mb = source_path.stat().st_size / (1024 * 1024)
-        self.split_summary_var.set(
-            f"PDF original: {source_path.name} ({original_mb:.2f} MB) | Parts creades: {len(created)} | Límit per part: 24 MB"
+    def on_close(self):
+        if self.pdf24_process is not None and self.pdf24_process.poll() is None:
+            try:
+                self.pdf24_process.terminate()
+            except Exception:
+                pass
+        self.closing = True
+        for after_id in list(self.after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self.after_ids.clear()
+        try:
+            if self.autosave_after_id:
+                self.root.after_cancel(self.autosave_after_id)
+        except tk.TclError:
+            pass
+        self.root.destroy()
+
+    def append_ocr_log(self, text):
+        def _write():
+            self.ocr_log_box.configure(state="normal")
+            self.ocr_log_box.insert("end", f"{text}\n")
+            self.ocr_log_box.see("end")
+            self.ocr_log_box.configure(state="disabled")
+            self.ocr_status_var.set(text)
+            percent_match = re.search(r"(?<!\d)(\d{1,3})(?:[.,]\d+)?\s*%", text)
+            if percent_match:
+                percent = max(0, min(100, int(percent_match.group(1))))
+                self.ocr_progress_var.set(percent)
+
+        self.safe_after(0, _write)
+
+    def clear_ocr_log(self):
+        self.ocr_log_box.configure(state="normal")
+        self.ocr_log_box.delete("1.0", "end")
+        self.ocr_log_box.configure(state="disabled")
+
+    def reset_ocr_state(self, message="Procés OCR netejat. Selecciona un PDF per començar."):
+        self.source_pdf = None
+        self.ocr_pdf = None
+        self.ocr_pages = []
+        self.ocr_current_page_index = None
+        self.ocr_dirty = False
+        self.ocr_pdf_path_var.set("")
+        self.ocr_result_path_var.set("Encara no s'ha generat.")
+        self.ocr_summary_var.set(message)
+        self.ocr_status_var.set(message)
+        self.ocr_progress_var.set(0)
+        for item in self.ocr_page_tree.get_children():
+            self.ocr_page_tree.delete(item)
+        self.ocr_editor.delete("1.0", "end")
+        self.clear_ocr_log()
+        self.append_ocr_log(message)
+
+    def cancel_ocr_process(self):
+        if self.pdf24_process is not None and self.pdf24_process.poll() is None:
+            try:
+                self.pdf24_process.terminate()
+            except Exception:
+                pass
+            self.pdf24_process = None
+        self.reset_ocr_state()
+
+    def pick_ocr_pdf(self):
+        path = filedialog.askopenfilename(
+            title="Selecciona un PDF",
+            filetypes=[("PDF", "*.pdf"), ("Tots", "*.*")],
         )
-        self.split_progress_var.set(100)
-        self.set_split_status(f"PDF dividit en {len(created)} parts.")
-        self.notebook.select(self.splitter_tab)
-        self.open_split_output_dir()
+        if path:
+            self.source_pdf = Path(path)
+            self.ocr_pdf_path_var.set(path)
+            size_mb = self.source_pdf.stat().st_size / (1024 * 1024)
+            self.ocr_summary_var.set(f"PDF carregat: {self.source_pdf.name} | {size_mb:.2f} MB")
+            self.ocr_progress_var.set(0)
+            self.append_ocr_log("PDF seleccionat.")
 
-    def split_pdf_by_size(self, source_path: Path, output_dir: Path, max_size_mb=24):
-        max_bytes = int(max_size_mb * 1024 * 1024)
-        reader = PdfReader(str(source_path))
-        created_files = []
-        chunk_page_indexes = []
-        part_number = 1
+    def open_ocr_pdf(self):
+        if not self.ocr_pdf or not self.ocr_pdf.exists():
+            messagebox.showinfo(APP_NAME, "Encara no hi ha cap PDF OCR generat.")
+            return
+        os.startfile(self.ocr_pdf)  # type: ignore[attr-defined]
 
-        def writer_size(page_indexes):
-            writer = PdfWriter()
-            for page_index in page_indexes:
-                writer.add_page(reader.pages[page_index])
-            buffer = BytesIO()
-            writer.write(buffer)
-            return buffer.getbuffer().nbytes
+    def pick_generated_ocr_pdf(self):
+        path = filedialog.askopenfilename(
+            title="Selecciona el PDF OCR guardat des de PDF24",
+            filetypes=[("PDF", "*.pdf"), ("Tots", "*.*")],
+        )
+        if not path:
+            return
+        self.ocr_pdf = Path(path)
+        self.ocr_result_path_var.set(path)
+        self.reload_text_from_ocr()
 
-        total_pages = len(reader.pages)
-        for page_index in range(total_pages):
-            proposed = chunk_page_indexes + [page_index]
-            proposed_size = writer_size(proposed)
-            if chunk_page_indexes and proposed_size > max_bytes:
-                created_files.append((self.save_pdf_chunk(reader, chunk_page_indexes, output_dir, source_path.stem, part_number), list(chunk_page_indexes)))
-                part_number += 1
-                chunk_page_indexes = [page_index]
-            else:
-                chunk_page_indexes = proposed
-            self.set_split_progress(page_index + 1, total_pages)
+    def load_ocr_pages_into_ui(self):
+        for item in self.ocr_page_tree.get_children():
+            self.ocr_page_tree.delete(item)
+        for page in self.ocr_pages:
+            preview = page.text.splitlines()[0] if page.text.strip() else "(sense text)"
+            self.ocr_page_tree.insert("", "end", iid=str(page.number - 1), values=(page.number, preview[:48]))
+        if self.ocr_pages:
+            self.ocr_page_tree.selection_set("0")
+            self.ocr_page_tree.focus("0")
+            self.populate_ocr_editor(0)
 
-        if chunk_page_indexes:
-            created_files.append((self.save_pdf_chunk(reader, chunk_page_indexes, output_dir, source_path.stem, part_number), list(chunk_page_indexes)))
+    def populate_ocr_editor(self, index: int):
+        self.ocr_current_page_index = index
+        self.ocr_suspend_dirty = True
+        try:
+            self.ocr_editor.delete("1.0", "end")
+            self.ocr_editor.insert("1.0", self.ocr_pages[index].text)
+            self.ocr_editor.edit_modified(False)
+        finally:
+            self.ocr_suspend_dirty = False
+        self.ocr_dirty = False
 
-        return created_files
+    def on_ocr_page_select(self, _event):
+        selection = self.ocr_page_tree.selection()
+        if not selection:
+            return
+        target = int(selection[0])
+        if self.ocr_current_page_index is not None and target != self.ocr_current_page_index and self.ocr_dirty:
+            self.apply_current_ocr_page()
+        self.populate_ocr_editor(target)
 
-    def save_pdf_chunk(self, reader, page_indexes, output_dir: Path, stem: str, part_number: int):
-        writer = PdfWriter()
-        for page_index in page_indexes:
-            writer.add_page(reader.pages[page_index])
-        output_path = output_dir / f"{stem}_part_{part_number:02d}.pdf"
-        with output_path.open("wb") as handle:
-            writer.write(handle)
-        return output_path
+    def on_ocr_editor_modified(self, _event):
+        if self.ocr_suspend_dirty:
+            self.ocr_editor.edit_modified(False)
+            return
+        self.ocr_dirty = True
+        self.ocr_status_var.set("Hi ha canvis pendents d'aplicar en la pàgina actual.")
+        self.ocr_editor.edit_modified(False)
+
+    def apply_current_ocr_page(self):
+        if self.ocr_current_page_index is None or not self.ocr_pages:
+            return True
+        self.ocr_pages[self.ocr_current_page_index].text = self.ocr_editor.get("1.0", "end-1c")
+        preview = self.ocr_pages[self.ocr_current_page_index].text.splitlines()[0] if self.ocr_pages[self.ocr_current_page_index].text.strip() else "(sense text)"
+        self.ocr_page_tree.item(
+            str(self.ocr_current_page_index),
+            values=(self.ocr_pages[self.ocr_current_page_index].number, preview[:48]),
+        )
+        self.ocr_dirty = False
+        self.ocr_status_var.set("Canvis aplicats.")
+        return True
+
+    def process_ocr_pdf(self):
+        source_text = self.ocr_pdf_path_var.get().strip()
+        if source_text:
+            self.source_pdf = Path(source_text)
+        if not self.source_pdf or not self.source_pdf.exists():
+            messagebox.showwarning(APP_NAME, "Selecciona abans un PDF.")
+            return
+        pdf24_ocr_exe = resolve_pdf24_ocr_exe()
+        if not pdf24_ocr_exe.exists():
+            messagebox.showerror(
+                APP_NAME,
+                "No he trobat PDF24 OCR.\n\n"
+                "Instal·la PDF24 Creator i torna-ho a provar.\n"
+                "L'instal·lador d'AutoCPV també intenta instal·lar-lo amb winget si falta.",
+            )
+            return
+
+        self.ocr_pdf = None
+        self.ocr_pages = []
+        self.ocr_current_page_index = None
+        self.ocr_dirty = False
+        self.ocr_result_path_var.set("Guarda el resultat des de PDF24 i després prem 'Carregar PDF OCR'.")
+        self.ocr_progress_var.set(0)
+        for item in self.ocr_page_tree.get_children():
+            self.ocr_page_tree.delete(item)
+        self.ocr_editor.delete("1.0", "end")
+        self.clear_ocr_log()
+
+        try:
+            self.pdf24_process = subprocess.Popen(
+                [str(pdf24_ocr_exe), str(self.source_pdf)],
+                cwd=str(pdf24_ocr_exe.parent),
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"No he pogut obrir PDF24 OCR: {exc}")
+            return
+
+        self.ocr_summary_var.set("PDF24 OCR està obert amb el PDF seleccionat. Fes l'OCR en PDF24 i guarda el resultat.")
+        self.ocr_status_var.set("PDF24 OCR obert. Esperant que carregues el PDF OCR resultant.")
+        self.append_ocr_log("PDF24 OCR obert amb el PDF seleccionat.")
+        self.append_ocr_log("Quan PDF24 acabe, guarda el PDF OCR i torna ací per prémer 'Carregar PDF OCR'.")
+    def reload_text_from_ocr(self):
+        if not self.ocr_pdf or not self.ocr_pdf.exists():
+            messagebox.showinfo(APP_NAME, "Encara no hi ha cap PDF OCR per a reprocessar.")
+            return
+        self.apply_current_ocr_page()
+        try:
+            self.ocr_pages = extract_document_pages(self.ocr_pdf)
+            self.load_ocr_pages_into_ui()
+            self.ocr_summary_var.set(f"Text reextret: {len(self.ocr_pages)} pàgines.")
+            self.append_ocr_log("Text reextret des del PDF OCR.")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def export_ocr_to_docx(self):
+        if not self.ocr_pages:
+            messagebox.showwarning(APP_NAME, "No hi ha text carregat per a exportar.")
+            return
+        self.apply_current_ocr_page()
+        output = filedialog.asksaveasfilename(
+            title="Guardar DOCX",
+            defaultextension=".docx",
+            filetypes=[("Word", "*.docx")],
+        )
+        if not output:
+            return
+        export_docx(self.ocr_pages, Path(output))
+        self.append_ocr_log(f"DOCX exportat: {output}")
+
+    def export_ocr_to_pdf(self):
+        if not self.ocr_pages:
+            messagebox.showwarning(APP_NAME, "No hi ha text carregat per a exportar.")
+            return
+        self.apply_current_ocr_page()
+        output = filedialog.asksaveasfilename(
+            title="Guardar PDF net",
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not output:
+            return
+        export_clean_pdf(self.ocr_pages, Path(output))
+        self.append_ocr_log(f"PDF net exportat: {output}")
+
+    def open_ai_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title("Configuracio IA")
+        window.geometry("620x260")
+        window.configure(bg=COLORS["paper"])
+        window.transient(self.root)
+        window.grab_set()
+
+        frame = ttk.Frame(window, style="Card.TFrame", padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="NVIDIA Integrate", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        ttk.Label(frame, text="API key", style="Body.TLabel").grid(row=1, column=0, sticky="w", pady=6)
+        key_entry = ttk.Entry(frame, textvariable=self.nvidia_api_key_var, width=64, show="*")
+        key_entry.grid(row=1, column=1, sticky="ew", pady=6)
+
+        ttk.Label(frame, text="Model", style="Body.TLabel").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.nvidia_model_var, width=64).grid(row=2, column=1, sticky="ew", pady=6)
+
+        ttk.Label(frame, text="Max tokens", style="Body.TLabel").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.nvidia_max_tokens_var, width=18).grid(row=3, column=1, sticky="w", pady=6)
+
+        ttk.Label(frame, text=f"Es guarda en {CONFIG_PATH}", style="Body.TLabel", wraplength=560).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 12))
+
+        buttons = ttk.Frame(frame, style="Card.TFrame")
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+
+        def save_settings():
+            api_key = self.nvidia_api_key_var.get().strip()
+            model = self.nvidia_model_var.get().strip() or DEFAULT_NVIDIA_MODEL
+            try:
+                max_tokens = int(self.nvidia_max_tokens_var.get().strip() or DEFAULT_NVIDIA_MAX_TOKENS)
+            except ValueError:
+                messagebox.showwarning(APP_NAME, "Max tokens ha de ser un numero.")
+                return
+            if max_tokens < 1000:
+                messagebox.showwarning(APP_NAME, "Max tokens hauria de ser com a minim 1000.")
+                return
+            self.nvidia_model_var.set(model)
+            self.nvidia_max_tokens_var.set(str(max_tokens))
+            self.config_data["ai"] = {
+                "nvidia_api_key": api_key,
+                "nvidia_model": model,
+                "nvidia_max_tokens": max_tokens,
+            }
+            save_app_config(self.config_data)
+            self.append_ocr_log("Configuracio IA guardada.")
+            window.destroy()
+
+        ttk.Button(buttons, text="Guardar", command=save_settings, style="Neutral.TButton").pack(side="right", padx=4)
+        ttk.Button(buttons, text="Cancel·lar", command=window.destroy, style="Neutral.TButton").pack(side="right", padx=4)
+        frame.columnconfigure(1, weight=1)
+        key_entry.focus_set()
+
+    def generate_excel_from_ocr_with_chatgpt(self):
+        if not self.ocr_pages:
+            messagebox.showwarning(APP_NAME, "Carrega primer un PDF OCR i extrau el text.")
+            return
+        localitat = self.ocr_localitat_var.get().strip()
+        if not localitat:
+            messagebox.showwarning(APP_NAME, "Escriu la localitat abans de generar l'Excel.")
+            return
+        prompt_path = resolve_prompt_path()
+        if not prompt_path.exists():
+            messagebox.showerror(APP_NAME, f"No he trobat el prompt en {prompt_path}.")
+            return
+        api_key = self.nvidia_api_key_var.get().strip() or os.environ.get("NVIDIA_API_KEY", "").strip()
+        if not api_key:
+            messagebox.showinfo(
+                APP_NAME,
+                "Encara no hi ha clau de NVIDIA configurada.\n\n"
+                "Prem 'Configurar IA' i guarda la clau NVIDIA per a este ordinador.",
+            )
+            self.append_ocr_log("Falta NVIDIA_API_KEY. La generacio amb ChatGPT queda preparada pero no s'ha executat.")
+            return
+        model = self.nvidia_model_var.get().strip() or DEFAULT_NVIDIA_MODEL
+        try:
+            max_tokens = int(self.nvidia_max_tokens_var.get().strip() or DEFAULT_NVIDIA_MAX_TOKENS)
+        except ValueError:
+            messagebox.showwarning(APP_NAME, "Revisa Configurar IA: Max tokens ha de ser un numero.")
+            return
+
+        self.apply_current_ocr_page()
+        output = filedialog.asksaveasfilename(
+            title="Guardar Excel generat per ChatGPT",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile=f"{localitat}_autocpv.xlsx",
+        )
+        if not output:
+            return
+
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        prompt_text = prompt_text.replace("{{LOCALITAT}}", localitat)
+        prompt_text = prompt_text.replace("{{FONT}}", self.ocr_font_var.get().strip())
+        prompt_text = prompt_text.replace("{{FITXER_BASE_OPCIONAL}}", "")
+        ocr_text = pages_to_prompt_text(self.ocr_pages)
+
+        def worker():
+            try:
+                self.safe_after(0, lambda: self.ocr_progress_var.set(10))
+                self.append_ocr_log("Preparant text OCR per a ChatGPT...")
+                result = call_ai_for_autocpv(prompt_text, ocr_text, api_key, self.append_ocr_log, model=model, max_tokens=max_tokens)
+                rows = result.get("rows", [])
+                if not isinstance(rows, list):
+                    raise RuntimeError("La resposta de ChatGPT no conté una llista de files.")
+                write_autocpv_excel(rows, Path(output))
+                report = result.get("report", {})
+                self.safe_after(0, lambda: self.ocr_progress_var.set(100))
+                self.append_ocr_log(f"Excel generat: {output}")
+                self.append_ocr_log(f"Files generades: {len(rows)}")
+                discarded = report.get("discarded", []) if isinstance(report, dict) else []
+                if discarded:
+                    self.append_ocr_log(f"Descartades rellevants: {len(discarded)}")
+                self.safe_after(0, lambda: self.ocr_summary_var.set(f"Excel generat amb ChatGPT: {Path(output).name} | Files: {len(rows)}"))
+                self.safe_after(0, lambda: self.excel_path_var.set(output))
+                self.safe_after(0, self.load_excel)
+            except Exception as exc:
+                self.append_ocr_log(f"Error generant Excel amb ChatGPT: {exc}")
+                self.safe_after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
+                self.safe_after(0, lambda: self.ocr_progress_var.set(0))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.append_ocr_log("Generació amb ChatGPT iniciada...")
 
     def show_shortcuts_help(self):
         window = tk.Toplevel(self.root)

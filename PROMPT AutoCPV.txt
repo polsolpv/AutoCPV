@@ -1,0 +1,278 @@
+TASCA
+Analitza exhaustivament el PDF OCR adjunt i extrau TOTES les activitats culturals que complisquen els criteris indicats. Genera un Excel professional amb les columnes exactes especificades.
+
+VARIABLES D’ENTRADA
+- LOCALITAT: {{LOCALITAT}}
+- PERSONA: Pol
+- PERÍODE VÀLID: del 01/02/2026 al 31/03/2026, ambdós inclosos
+- FONT: {{FONT}}
+- MODE D’EIXIDA:
+  - "excel_nou": crea un Excel només amb les activitats d’aquesta localitat.
+  - "afegir_a_excel": afegeix les activitats al fitxer Excel base proporcionat, sense modificar les files existents.
+- FITXER_BASE: {{FITXER_BASE_OPCIONAL}}
+
+REGLA CRÍTICA SOBRE EL PERÍODE
+Només s’han d’incloure activitats que es desenvolupen entre l’1 de febrer i el 31 de març de 2026.
+
+MOLT IMPORTANT:
+- La data important és la DATA DE L’ACTIVITAT, no la data de publicació.
+- Si una publicació està feta en febrer o març però anuncia una activitat d’abril, maig o qualsevol altre mes posterior, DESCARTA-LA.
+- Si una activitat té un rang de dates:
+  - Si tot el rang està dins de febrer-març, crea una sola fila amb el primer dia.
+  - Si el rang comença en març però continua en abril o mesos posteriors, DESCARTA-LA, excepte si hi ha una inauguració, presentació o acte puntual clarament datat dins de febrer-març. En eixe cas, inclou només eixe acte puntual.
+- Si no hi ha data clara de l’activitat, NO la inclogues en l’Excel. Posa-la només en l’informe de descartades per “data no verificable”.
+
+METODOLOGIA OBLIGATÒRIA
+
+FASE 1 — DETECCIÓ EXHAUSTIVA
+Revisa el PDF pàgina per pàgina, sense saltar-ne cap.
+Per a cada pàgina:
+- Indica el número de pàgina.
+- Llista totes les possibles activitats detectades.
+- Si no hi ha cap activitat cultural o potencialment cultural, indica: “cap activitat cultural”.
+- No faces encara el filtrat definitiu en aquesta fase.
+- Si el PDF és tipus Facebook, calendari o agenda llarga, revisa també els textos narratius, no només els cartells.
+
+FASE 2 — FILTRAT
+Aplica els criteris següents.
+
+INCLOU:
+- Cinema
+- Teatre
+- Música
+- Dansa
+- Exposicions
+- Presentacions de llibres
+- Conferències, xarrades i taules redones culturals
+- Activitats 8M si tenen component cultural: teatre, conferència, lectura, exposició, recital, taller cultural
+- Tallers culturals: literatura, teatre, lectura, art, museu, oralitat, còmic, fotografia, dansa
+- Contacontes i narració oral
+- Lectures de poemes
+- Lectures en veu alta
+- Clubs de lectura
+- Activitats de patrimoni: visites guiades, rutes històriques, refugis, museus, patrimoni local
+- Concerts de bandes, orquestres, conservatoris, corals o música instrumental
+- Actes dins de festes o Setmana Santa només si són clarament culturals i separables: concerts, recitals, exposicions, presentacions, teatre
+
+EXCLOU:
+- Avisos, talls de llum, obres, serveis, trànsit, ecomòbil, neteja urbana
+- Informació institucional sense activitat cultural
+- Activitats esportives
+- Mercats, mercadets, campanyes comercials, bons, promocions comercials
+- Gastronomia comercial o jornades gastronòmiques sense component cultural clar
+- Misses, processons, viacrucis, litúrgia i actes religiosos purs
+- Falles, carnestoltes i festes genèriques, excepte si dins hi ha un acte cultural concret i datat
+- Cursos laborals, orientació laboral, emprenedoria, finances, empresa
+- Tallers sanitaris o preventius sense component cultural
+- Activitats escolars internes sense obertura cultural pública
+- Inscripcions, convocatòries o concursos oberts sense acte presencial concret dins del període
+- Activitats d’abril, maig o altres mesos, encara que apareguen al PDF de febrer/març
+
+REGLA DE DUBTE
+Si dubtes si una activitat és cultural, INCLOU-LA, sempre que tinga data clara dins del període.
+Però si el dubte és sobre la data, NO la inclogues.
+
+FASE 3 — NORMALITZACIÓ EN EXCEL
+Crea un Excel amb EXACTAMENT aquestes columnes i aquest ordre:
+
+1. Localitat
+2. Data
+3. Categoria
+4. En cas d'altres, quina?
+5. Nom de l'activitat
+6. Companyia, artista
+7. Lloc
+8. Llengua de l'activitat
+9. Preu
+10. Regidoria organitzadora
+11. Llengua de la publicitat
+12. Font
+13. Persona que ha introduït les dades
+
+REGLES DE CADA CAMP
+
+Localitat:
+- Sempre exactament: {{LOCALITAT}}
+- No reutilitzes localitats d’altres PDFs.
+- No poses “Cheste” o cap altra localitat per defecte.
+
+Data:
+- Ha de ser una data real d’Excel, no text.
+- Format visual recomanat: dd/mm/yyyy.
+- Si hi ha rang vàlid dins febrer-març, posa només el primer dia.
+- Si hi ha diverses sessions en dies diferents, crea una fila per cada dia.
+- Si la mateixa activitat es repeteix en el mateix dia però apareix duplicada al PDF, crea només una fila.
+
+Categoria:
+Només pot ser una d’aquestes opcions exactes:
+- Teatre
+- Cinema
+- Música
+- Exposició
+- Presentació llibre
+- Lectura poemes
+- Monòlegs
+- Contacontes
+- Taller de teatre
+- Taller literari
+- Dansa
+- Taller/curs de dansa
+- Activitats sobre patrimoni
+- Lectura en veu alta
+- Club de lectura
+- Conferència
+- Altres
+
+No uses categories fora d’aquesta llista.
+No uses “Taller” com a categoria general.
+No uses “Presentació” com a categoria general.
+
+Criteris de categoria:
+- Presentació d’un llibre, conte, poemari o revista literària → Presentació llibre.
+- Projecció de pel·lícula, documental o curtmetratges → Cinema.
+- Documental amb debat → Cinema, excepte si el PDF ho presenta clarament com xarrada; en eixe cas Conferència.
+- Show d’humor, stand-up, comèdia d’un humorista → Monòlegs.
+- Obra escènica amb companyia/personatges → Teatre.
+- Contes per a infants → Contacontes.
+- Narració oral per a adults → Contacontes si el PDF ho diu com a contes/narració; si és ambigu, Altres i especifica “Narració oral”.
+- Taller de lectura, animació lectora, escriptura o literatura → Taller literari.
+- Taller d’art, museu, collage, fotografia, còmic o expressió cultural no inclòs en categories específiques → Altres i especifica “Taller cultural”.
+- Concerts, recitals musicals, bandes, orquestres, corals → Música.
+- Ballet, flamenc escènic o espectacles de dansa → Dansa.
+- Rutes històriques, visites guiades, refugis, patrimoni, museus → Activitats sobre patrimoni.
+- Conferències, xarrades, taules redones → Conferència.
+- Quan Categoria siga “Altres”, el camp “En cas d'altres, quina?” és obligatori.
+
+En cas d'altres, quina?
+- Només s’ompli si Categoria = Altres.
+- Ha de ser descriptiu i breu: “Narració oral”, “Taller cultural”, “Gala cultural”, “Màgia”, “Circ”, etc.
+- Si Categoria no és Altres, deixa el camp buit.
+
+Nom de l'activitat:
+- Escriu el títol exacte o el més fidel possible.
+- No inventes títols.
+- Si el títol és incomplet però hi ha descripció clara, usa una formulació mínima basada en el PDF.
+- No afegisques informació que no estiga al PDF.
+
+Companyia, artista:
+- Ompli només si apareix clarament.
+- Pot ser companyia, autor/a, ponent, artista, director/a, coral, banda, grup.
+- Si no apareix, deixa buit.
+- No inventes.
+
+Lloc:
+- Ompli només si apareix clarament.
+- Si no apareix, deixa buit.
+- No poses “No hi ha informació” en aquest camp.
+
+Llengua de l'activitat:
+Valors permesos:
+- Valencià/català
+- Espanyol
+- Anglès
+- Bilingüe
+- Activitat sense llengua
+- No hi ha informació
+- Altres
+
+Regles:
+- No uses mai “Castellà”. El valor correcte és “Espanyol”.
+- Si l’activitat és en valencià/català, posa exactament “Valencià/català”.
+- Si és música instrumental, banda, orquestra, conservatori, piano, música sacra instrumental o dansa sense veu/parla, posa “Activitat sense llengua”.
+- Si és música cantada i la llengua és clara, posa la llengua corresponent.
+- Si és cinema i el PDF indica “castellà”, “VOSE”, “VOSC”, etc., reflecteix-ho segons l’evidència:
+  - castellà / español → Espanyol
+  - VOSC en valencià/català o subtítols en català si clar → Valencià/català o Bilingüe segons el cas
+- Si no es veu clar, posa “No hi ha informació”.
+- No assumisques la llengua només pel títol de l’obra.
+
+Preu:
+- Si posa gratis, gratuït, entrada lliure, reserva gratuïta o similar → 0.
+- Si hi ha preu general, posa només el número, sense símbol €.
+- Si hi ha preu general i reduït, posa el preu general.
+- Si el preu varia segons restaurant, reserva, tarifa o no està clar → deixa buit.
+- No escrigues “€” ni “gratis”.
+- Ha de ser valor numèric quan hi haja preu.
+
+Regidoria organitzadora:
+Valors permesos:
+- Cultura
+- Joventut
+- Igualtat
+- Altres
+- En col·laboració
+
+Regles:
+- Si és programació cultural general → Cultura.
+- Si és activitat juvenil clara → Joventut.
+- Si és 8M, dona, igualtat, violència de gènere o Casa de la Dona → Igualtat.
+- Si hi ha diverses entitats o col·laboració explícita → En col·laboració.
+- Si no està clar → Altres.
+- No uses “Turisme”, “Educació”, “Esports” o altres valors fora de la llista.
+
+Llengua de la publicitat:
+Valors permesos:
+- Valencià/català
+- Espanyol
+- Bilingüe
+- Anglès
+- Altres
+
+Regles:
+- Detecta l’idioma del cartell, agenda o text original.
+- No compten textos automàtics de Facebook com “Ver traducción”.
+- Si hi ha valencià/català i espanyol de manera rellevant → Bilingüe.
+- Si només hi ha valencià/català → Valencià/català.
+- Si només hi ha espanyol → Espanyol.
+- Si predomina una altra llengua → Altres o Anglès si és anglès.
+
+Font:
+- Posa exactament el valor de {{FONT}}.
+- No inventes URLs.
+- No uses una font d’un altre municipi.
+- Si {{FONT}} està buit, posa el nom del PDF o “PDF OCR proporcionat”.
+
+Persona que ha introduït les dades:
+- Sempre: Pol.
+
+CONTROL DE DUPLICATS
+Abans de generar l’Excel:
+- Elimina duplicats de la mateixa activitat quan aparega repetida en diverses pàgines o publicacions.
+- Considera duplicat si coincideixen data + nom + lloc.
+- Si la repetició aporta informació millor, fusiona les dades en una sola fila.
+- Si són sessions en dates diferents, NO és duplicat: crea una fila per data.
+- Si són activitats diferents el mateix dia i lloc, crea files separades.
+
+CONTROL DE QUALITAT FINAL
+Abans de crear l’Excel, comprova:
+1. Que totes les pàgines han sigut revisades.
+2. Que només hi ha activitats entre 01/02/2026 i 31/03/2026.
+3. Que no hi ha activitats d’abril o posteriors.
+4. Que no hi ha duplicats.
+5. Que no hi ha camps inventats.
+6. Que totes les categories pertanyen a la llista tancada.
+7. Que no apareix mai “Castellà”; sempre ha de ser “Espanyol”.
+8. Que en “Llengua de l'activitat” no apareix “Valencià” sol; ha de ser “Valencià/català”.
+9. Que els concerts instrumentals tenen “Activitat sense llengua”.
+10. Que els camps buits són realment buits, no textos tipus “desconegut”.
+11. Que si Categoria = Altres, “En cas d'altres, quina?” està omplit.
+12. Que les dates són dates reals d’Excel.
+
+SI NO ES POT GARANTIR EXHAUSTIVITAT
+No generes l’Excel.
+Atura’t i informa clarament:
+- quines pàgines no s’han pogut revisar,
+- quin problema hi ha,
+- què falta per poder garantir l’extracció.
+
+OUTPUT FINAL
+Entrega:
+1. Fitxer Excel descarregable.
+2. Resum de control:
+   - Localitat
+   - Pàgines revisades / total
+   - Total d’activitats detectades
+   - Total de files generades
+   - Activitats descartades rellevants i motiu: fora de període, esport, mercat, institucional, sense data, duplicat, etc.
+3. No inclogues activitats en una taula global si el mode és “excel_nou”.
+4. Si el mode és “afegir_a_excel”, conserva el fitxer base i afegeix només les noves files al final.
